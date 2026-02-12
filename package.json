@@ -1,0 +1,22 @@
+{
+  "name": "whatsapp-onboarding-plan",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "generate-codes": "node scripts/generate-codes.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.95.3",
+    "dotenv": "^17.2.4",
+    "express": "^5.2.1",
+    "twilio": "^5.12.1",
+    "uuid": "^13.0.0"
+  }
+}
