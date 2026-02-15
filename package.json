@@ -16,7 +16,6 @@
     "@supabase/supabase-js": "^2.95.3",
     "dotenv": "^17.2.4",
     "express": "^5.2.1",
-    "twilio": "^5.12.1",
     "uuid": "^13.0.0"
   }
 }

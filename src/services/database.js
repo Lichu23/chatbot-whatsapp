@@ -3,6 +3,122 @@ const { config, STEPS } = require('../config');
 
 const supabase = createClient(config.supabase.url, config.supabase.key);
 
+// ── Phone Config Cache ──
+
+const phoneConfigCache = {}; // key: metaPhoneNumberId, value: { config, fetchedAt }
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function clearPhoneConfigCache() {
+  for (const key of Object.keys(phoneConfigCache)) {
+    delete phoneConfigCache[key];
+  }
+}
+
+// ── Health Check ──
+
+async function healthCheck() {
+  const { error } = await supabase.from('businesses').select('id').limit(1);
+  if (error) throw error;
+}
+
+// ── Failed Messages ──
+
+async function logFailedMessage(phoneNumberId, senderPhone, payload, error) {
+  const { error: insertErr } = await supabase.from('failed_messages').insert({
+    phone_number_id: phoneNumberId,
+    sender_phone: senderPhone,
+    raw_payload: payload,
+    error_message: error?.message || String(error),
+    error_stack: error?.stack || null,
+  });
+  if (insertErr) throw insertErr;
+}
+
+// ── Webhook Logs ──
+
+async function logWebhook(phoneNumberId, senderPhone, messageType, payload) {
+  const { error } = await supabase.from('webhook_logs').insert({
+    phone_number_id: phoneNumberId,
+    sender_phone: senderPhone,
+    message_type: messageType,
+    raw_payload: payload,
+  });
+  if (error) throw error;
+}
+
+async function cleanupWebhookLogs() {
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const { error } = await supabase.from('webhook_logs').delete().lt('created_at', cutoff);
+  if (error) throw error;
+}
+
+// ── Phone Numbers ──
+
+async function getPhoneConfig(metaPhoneNumberId) {
+  const cached = phoneConfigCache[metaPhoneNumberId];
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) {
+    return cached.config;
+  }
+
+  const { data, error } = await supabase
+    .from('phone_numbers')
+    .select('*')
+    .eq('meta_phone_number_id', metaPhoneNumberId)
+    .single();
+
+  if (error && error.code !== 'PGRST116') throw error;
+  if (!data) return null;
+
+  const phoneConfig = {
+    id: data.id,
+    metaPhoneNumberId: data.meta_phone_number_id,
+    token: data.meta_whatsapp_token,
+    catalogId: data.catalog_id,
+    displayName: data.display_name,
+    businessId: data.business_id,
+    isActive: data.is_active,
+  };
+
+  phoneConfigCache[metaPhoneNumberId] = { config: phoneConfig, fetchedAt: Date.now() };
+  return phoneConfig;
+}
+
+async function getPhoneConfigById(id) {
+  const { data, error } = await supabase
+    .from('phone_numbers')
+    .select('*')
+    .eq('id', id)
+    .single();
+
+  if (error && error.code !== 'PGRST116') throw error;
+  if (!data) return null;
+
+  return {
+    id: data.id,
+    metaPhoneNumberId: data.meta_phone_number_id,
+    token: data.meta_whatsapp_token,
+    catalogId: data.catalog_id,
+    displayName: data.display_name,
+    businessId: data.business_id,
+    isActive: data.is_active,
+  };
+}
+
+async function getBusinessByPhoneNumberId(metaPhoneNumberId) {
+  const phoneConfig = await getPhoneConfig(metaPhoneNumberId);
+  if (!phoneConfig || !phoneConfig.businessId) return null;
+
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('*')
+    .eq('id', phoneConfig.businessId)
+    .eq('is_active', true)
+    .single();
+
+  if (error && error.code !== 'PGRST116') throw error;
+  return data;
+}
+
 // ── Invite Codes ──
 
 async function findInviteCode(code) {
@@ -236,6 +352,7 @@ async function insertProducts(businessId, products) {
     description: p.description || null,
     price: p.price,
     category: p.category || null,
+    ...(p.retailer_id && { retailer_id: p.retailer_id }),
   }));
 
   const { data, error } = await supabase
@@ -278,14 +395,28 @@ async function toggleProductAvailability(productId) {
   return !product.is_available;
 }
 
+async function updateProductRetailerId(productId, retailerId) {
+  const { error } = await supabase
+    .from('products')
+    .update({ retailer_id: retailerId, updated_at: new Date().toISOString() })
+    .eq('id', productId);
+
+  if (error) throw error;
+}
+
 // ── Customer States ──
 
-async function getCustomerState(phone) {
-  const { data, error } = await supabase
+async function getCustomerState(phone, businessId = null) {
+  let query = supabase
     .from('customer_states')
     .select('*')
-    .eq('phone', phone)
-    .single();
+    .eq('phone', phone);
+
+  if (businessId) {
+    query = query.eq('business_id', businessId);
+  }
+
+  const { data, error } = await query.single();
 
   if (error && error.code !== 'PGRST116') throw error;
   return data;
@@ -300,7 +431,7 @@ async function upsertCustomerState(phone, fields) {
         ...fields,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'phone' }
+      { onConflict: 'phone,business_id' }
     )
     .select()
     .single();
@@ -309,30 +440,36 @@ async function upsertCustomerState(phone, fields) {
   return data;
 }
 
-async function updateCustomerStep(phone, step) {
-  const { error } = await supabase
+async function updateCustomerStep(phone, step, businessId = null) {
+  let query = supabase
     .from('customer_states')
     .update({ current_step: step, updated_at: new Date().toISOString() })
     .eq('phone', phone);
 
+  if (businessId) query = query.eq('business_id', businessId);
+  const { error } = await query;
   if (error) throw error;
 }
 
-async function updateCustomerCart(phone, cart) {
-  const { error } = await supabase
+async function updateCustomerCart(phone, cart, businessId = null) {
+  let query = supabase
     .from('customer_states')
     .update({ cart, updated_at: new Date().toISOString() })
     .eq('phone', phone);
 
+  if (businessId) query = query.eq('business_id', businessId);
+  const { error } = await query;
   if (error) throw error;
 }
 
-async function deleteCustomerState(phone) {
-  const { error } = await supabase
+async function deleteCustomerState(phone, businessId = null) {
+  let query = supabase
     .from('customer_states')
     .delete()
     .eq('phone', phone);
 
+  if (businessId) query = query.eq('business_id', businessId);
+  const { error } = await query;
   if (error) throw error;
 }
 
@@ -469,7 +606,44 @@ async function getSalesSummary(businessId, since) {
   };
 }
 
+async function linkBusinessToPhoneNumber(phoneNumberRowId, businessId) {
+  // Set business_id on phone_numbers row
+  const { error: phoneErr } = await supabase
+    .from('phone_numbers')
+    .update({ business_id: businessId })
+    .eq('id', phoneNumberRowId);
+
+  if (phoneErr) throw phoneErr;
+
+  // Set phone_number_id on businesses row
+  const { error: bizErr } = await supabase
+    .from('businesses')
+    .update({ phone_number_id: phoneNumberRowId, updated_at: new Date().toISOString() })
+    .eq('id', businessId);
+
+  if (bizErr) throw bizErr;
+
+  // Invalidate cache for this phone number
+  for (const [key, cached] of Object.entries(phoneConfigCache)) {
+    if (cached.config?.id === phoneNumberRowId) {
+      delete phoneConfigCache[key];
+      break;
+    }
+  }
+}
+
 module.exports = {
+  // Health & logging
+  healthCheck,
+  logFailedMessage,
+  logWebhook,
+  cleanupWebhookLogs,
+  // Phone numbers
+  getPhoneConfig,
+  getPhoneConfigById,
+  getBusinessByPhoneNumberId,
+  clearPhoneConfigCache,
+  linkBusinessToPhoneNumber,
   findInviteCode,
   markCodeAsUsed,
   findAdmin,
@@ -490,6 +664,7 @@ module.exports = {
   insertProducts,
   deleteProduct,
   toggleProductAvailability,
+  updateProductRetailerId,
   // Customer states
   getCustomerState,
   upsertCustomerState,

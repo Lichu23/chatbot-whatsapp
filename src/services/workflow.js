@@ -1,18 +1,22 @@
 const db = require('./database');
-const ollama = require('./ollama');
+const ai = require('./ai');
 const { tryRegister } = require('./registration');
-const { sendMessage } = require('./twilio');
+const { sendMessage, sendButtons, sendList } = require('./whatsapp');
 const { processCustomerMessage } = require('./customer-workflow');
+const { syncCatalogToDatabase, setProductVisibility, setProductAvailability } = require('./catalog');
 const { config, STEPS, PAYMENT_OPTIONS, getPaymentLabel } = require('../config');
 const { parseCommand } = require('../utils/commands');
 
 const CUSTOMER_MSG = 'El negocio se está configurando, volvé pronto.';
 
+// Temporary in-memory store for pause product selection (phone → productId)
+const pauseProductSelection = new Map();
+
 /**
  * Main orchestration — routes every incoming message to the right handler.
  */
 async function processMessage(message) {
-  const { from, text, profileName } = message;
+  const { from, text, profileName, phoneConfig } = message;
   console.log(`\n🔄 processMessage: from=${from}, text="${text}"`);
 
   const admin = await db.findAdmin(from);
@@ -24,16 +28,16 @@ async function processMessage(message) {
 
     if (!state) {
       console.log('⚠️  Admin exists but no state — sending customer message');
-      return sendMessage(from, CUSTOMER_MSG);
+      return sendMessage(phoneConfig, from, CUSTOMER_MSG);
     }
 
     if (state.current_step === STEPS.COMPLETED) {
       console.log('🎯 Routing to command handler');
-      return handleCommand(from, text, state.business_id);
+      return handleCommand(phoneConfig, from, text, state.business_id);
     }
 
     console.log(`🎯 Routing to step handler: ${state.current_step}`);
-    return handleStep(from, text, state);
+    return handleStep(phoneConfig, from, text, state);
   }
 
   // Not an admin — try registration first
@@ -42,88 +46,99 @@ async function processMessage(message) {
   console.log(`🆕 Registration result: ${JSON.stringify({ success: result.success, isCode: result.isCode })}`);
 
   if (result.isCode) {
-    return sendMessage(from, result.message);
+    return sendMessage(phoneConfig, from, result.message);
   }
 
   // Not a code — check if there's an active business for customer ordering
-  const activeBusiness = await db.getActiveBusiness();
+  let activeBusiness = null;
+  if (message.phoneNumberId) {
+    activeBusiness = await db.getBusinessByPhoneNumberId(message.phoneNumberId);
+  }
+  if (!activeBusiness) {
+    activeBusiness = await db.getActiveBusiness();
+  }
+
   if (activeBusiness) {
     console.log(`🛒 Active business found: ${activeBusiness.business_name} — routing to customer flow`);
-    return processCustomerMessage(message, activeBusiness);
+    return processCustomerMessage(message, activeBusiness, phoneConfig);
   }
 
   console.log('⚠️  No active business — sending "volvé pronto"');
-  return sendMessage(from, CUSTOMER_MSG);
+  return sendMessage(phoneConfig, from, CUSTOMER_MSG);
 }
 
 // ══════════════════════════════════════
 // STEP ROUTER (onboarding + edit mode)
 // ══════════════════════════════════════
 
-async function handleStep(phone, text, state) {
+async function handleStep(pc, phone, text, state) {
   const { current_step, business_id } = state;
 
   switch (current_step) {
     // ── Onboarding steps ──
     case STEPS.BUSINESS_NAME:
-      return handleBusinessName(phone, text, business_id);
+      return handleBusinessName(pc, phone, text, business_id);
     case STEPS.BUSINESS_HOURS:
-      return handleBusinessHours(phone, text, business_id);
+      return handleBusinessHours(pc, phone, text, business_id);
     case STEPS.BUSINESS_HOURS_CONFIRM:
-      return handleBusinessHoursConfirm(phone, text, business_id);
+      return handleBusinessHoursConfirm(pc, phone, text, business_id);
     case STEPS.DELIVERY_METHOD:
-      return handleDeliveryMethod(phone, text, business_id);
+      return handleDeliveryMethod(pc, phone, text, business_id);
     case STEPS.PICKUP_ADDRESS:
-      return handlePickupAddress(phone, text, business_id);
+      return handlePickupAddress(pc, phone, text, business_id);
     case STEPS.PAYMENT_METHODS:
-      return handlePaymentMethods(phone, text, business_id);
+      return handlePaymentMethods(pc, phone, text, business_id);
     case STEPS.DEPOSIT_PERCENT:
-      return handleDepositPercent(phone, text, business_id);
+      return handleDepositPercent(pc, phone, text, business_id);
     case STEPS.DELIVERY_ZONES:
-      return handleDeliveryZones(phone, text, business_id);
+      return handleDeliveryZones(pc, phone, text, business_id);
     case STEPS.DELIVERY_ZONES_CONFIRM:
-      return handleDeliveryZonesConfirm(phone, text, business_id);
+      return handleDeliveryZonesConfirm(pc, phone, text, business_id);
     case STEPS.BANK_DATA:
-      return handleBankData(phone, text, business_id);
+      return handleBankData(pc, phone, text, business_id);
     case STEPS.BANK_DATA_CONFIRM:
-      return handleBankDataConfirm(phone, text, business_id);
+      return handleBankDataConfirm(pc, phone, text, business_id);
     case STEPS.PRODUCTS:
-      return handleProducts(phone, text, business_id);
+      return handleProducts(pc, phone, text, business_id);
     case STEPS.REVIEW:
-      return handleReview(phone, text, business_id);
+      return handleReview(pc, phone, text, business_id);
 
     // ── Edit-mode steps (post-onboarding) ──
     case STEPS.EDIT_NAME:
-      return handleEditName(phone, text, business_id);
+      return handleEditName(pc, phone, text, business_id);
     case STEPS.EDIT_HOURS:
-      return handleEditHours(phone, text, business_id);
+      return handleEditHours(pc, phone, text, business_id);
     case STEPS.EDIT_HOURS_CONFIRM:
-      return handleEditHoursConfirm(phone, text, business_id);
+      return handleEditHoursConfirm(pc, phone, text, business_id);
     case STEPS.EDIT_DELIVERY:
-      return handleEditDelivery(phone, text, business_id);
+      return handleEditDelivery(pc, phone, text, business_id);
     case STEPS.EDIT_ADDRESS:
-      return handleEditAddress(phone, text, business_id);
+      return handleEditAddress(pc, phone, text, business_id);
     case STEPS.EDIT_PAYMENTS:
-      return handleEditPayments(phone, text, business_id);
+      return handleEditPayments(pc, phone, text, business_id);
     case STEPS.EDIT_DEPOSIT_PERCENT:
-      return handleEditDepositPercent(phone, text, business_id);
+      return handleEditDepositPercent(pc, phone, text, business_id);
     case STEPS.EDIT_ZONES:
-      return handleEditZones(phone, text, business_id);
+      return handleEditZones(pc, phone, text, business_id);
     case STEPS.EDIT_ZONES_CONFIRM:
-      return handleEditZonesConfirm(phone, text, business_id);
+      return handleEditZonesConfirm(pc, phone, text, business_id);
     case STEPS.EDIT_BANK:
-      return handleEditBank(phone, text, business_id);
+      return handleEditBank(pc, phone, text, business_id);
     case STEPS.EDIT_BANK_CONFIRM:
-      return handleEditBankConfirm(phone, text, business_id);
+      return handleEditBankConfirm(pc, phone, text, business_id);
     case STEPS.EDIT_PRODUCTS:
-      return handleEditProducts(phone, text, business_id);
+      return handleEditProducts(pc, phone, text, business_id);
     case STEPS.DELETE_PRODUCT:
-      return handleDeleteProduct(phone, text, business_id);
+      return handleDeleteProduct(pc, phone, text, business_id);
     case STEPS.PAUSE_PRODUCT:
-      return handlePauseProduct(phone, text, business_id);
+      return handlePauseProduct(pc, phone, text, business_id);
+    case STEPS.PAUSE_PRODUCT_ACTION:
+      return handlePauseProductAction(pc, phone, text, business_id);
+    case STEPS.LINK_CATALOG:
+      return handleLinkCatalog(pc, phone, text, business_id);
 
     default:
-      return sendMessage(phone, '⚠️ Estado desconocido. Escribí *AYUDA*.');
+      return sendMessage(pc, phone, '⚠️ Estado desconocido. Escribí *AYUDA*.');
   }
 }
 
@@ -133,28 +148,28 @@ async function handleStep(phone, text, state) {
 
 // ── Step 1: Business Name ──
 
-async function handleBusinessName(phone, text, businessId) {
+async function handleBusinessName(pc, phone, text, businessId) {
   if (!text || text.trim().length === 0) {
-    return sendMessage(phone, '⚠️ El nombre no puede estar vacío. ¿Cuál es el nombre de tu negocio?');
+    return sendMessage(pc, phone, '⚠️ El nombre no puede estar vacío. ¿Cuál es el nombre de tu negocio?');
   }
 
   const name = text.trim();
   await db.updateBusiness(businessId, { business_name: name });
   await db.updateUserStep(phone, STEPS.BUSINESS_HOURS);
 
-  return sendMessage(phone,
+  return sendMessage(pc, phone,
     `✅ Nombre guardado: *${name}*\n\n` +
-    '**Paso 2 de 8** — ¿Cuál es tu horario de atención?\n' +
+    '**Paso 2 de 7** — ¿Cuál es tu horario de atención?\n' +
     'Ej: Lunes a Viernes 11:00-23:00, Sábados 12:00-24:00'
   );
 }
 
 // ── Step 2: Business Hours (AI) ──
 
-async function handleBusinessHours(phone, text, businessId) {
+async function handleBusinessHours(pc, phone, text, businessId) {
   const parsed = await parseHours(text);
   if (!parsed) {
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       '🤔 No pude interpretar el horario. Probá con un formato como:\n' +
       '"Lunes a Viernes 11:00-23:00, Sábados 12:00-24:00"'
     );
@@ -163,52 +178,65 @@ async function handleBusinessHours(phone, text, businessId) {
   await db.updateBusiness(businessId, { business_hours: parsed });
   await db.updateUserStep(phone, STEPS.BUSINESS_HOURS_CONFIRM);
 
-  return sendMessage(phone,
-    `✅ Horario guardado:\n*${parsed}*\n\n` +
-    '¿Está bien? Respondé *SÍ* para continuar o escribí el horario de nuevo.'
+  return sendButtons(pc, phone,
+    `✅ Horario guardado:\n*${parsed}*\n\n¿Está bien?`,
+    [
+      { id: 'si', title: 'Sí, continuar' },
+      { id: 'no', title: 'Escribir de nuevo' },
+    ]
   );
 }
 
-async function handleBusinessHoursConfirm(phone, text, businessId) {
+async function handleBusinessHoursConfirm(pc, phone, text, businessId) {
   if (isYes(text)) {
     await db.updateUserStep(phone, STEPS.DELIVERY_METHOD);
-    return sendMessage(phone,
-      '**Paso 3 de 8** — ¿Cómo entregás los pedidos?\n\n' +
-      '1️⃣ Delivery\n2️⃣ Retiro en local\n3️⃣ Ambos'
+    return sendButtons(pc, phone,
+      '**Paso 3 de 7** — ¿Cómo entregás los pedidos?',
+      [
+        { id: '1', title: 'Delivery' },
+        { id: '2', title: 'Retiro en local' },
+        { id: '3', title: 'Ambos' },
+      ]
     );
   }
   await db.updateUserStep(phone, STEPS.BUSINESS_HOURS);
-  return handleBusinessHours(phone, text, businessId);
+  return handleBusinessHours(pc, phone, text, businessId);
 }
 
 // ── Step 3: Delivery / Pickup ──
 
-async function handleDeliveryMethod(phone, text, businessId) {
+async function handleDeliveryMethod(pc, phone, text, businessId) {
   const option = text.trim();
 
   if (option === '1') {
     await db.updateBusiness(businessId, { has_delivery: true, has_pickup: false });
     await db.updateUserStep(phone, STEPS.PAYMENT_METHODS);
-    return sendMessage(phone, '✅ Configuración guardada: solo delivery.\n\n' + paymentMethodsPrompt());
+    return sendPaymentMethodsList(pc, phone, '✅ Configuración guardada: solo delivery.\n\n**Paso 4 de 7** — ¿Qué métodos de pago aceptás?');
   }
   if (option === '2') {
     await db.updateBusiness(businessId, { has_delivery: false, has_pickup: true });
     await db.updateUserStep(phone, STEPS.PICKUP_ADDRESS);
-    return sendMessage(phone, '¿Cuál es la dirección de tu local?');
+    return sendMessage(pc, phone, '¿Cuál es la dirección de tu local?');
   }
   if (option === '3') {
     await db.updateBusiness(businessId, { has_delivery: true, has_pickup: true });
     await db.updateUserStep(phone, STEPS.PICKUP_ADDRESS);
-    return sendMessage(phone, '¿Cuál es la dirección de tu local? (para retiro en local)');
+    return sendMessage(pc, phone, '¿Cuál es la dirección de tu local? (para retiro en local)');
   }
-  return sendMessage(phone, '⚠️ Elegí una opción:\n\n1️⃣ Delivery\n2️⃣ Retiro en local\n3️⃣ Ambos');
+  return sendButtons(pc, phone, '⚠️ Elegí una opción:',
+    [
+      { id: '1', title: 'Delivery' },
+      { id: '2', title: 'Retiro en local' },
+      { id: '3', title: 'Ambos' },
+    ]
+  );
 }
 
 // ── Step 3b: Pickup Address ──
 
-async function handlePickupAddress(phone, text, businessId) {
+async function handlePickupAddress(pc, phone, text, businessId) {
   if (!text || text.trim().length === 0) {
-    return sendMessage(phone, '⚠️ La dirección no puede estar vacía. ¿Cuál es la dirección de tu local?');
+    return sendMessage(pc, phone, '⚠️ La dirección no puede estar vacía. ¿Cuál es la dirección de tu local?');
   }
 
   const address = text.trim();
@@ -221,27 +249,33 @@ async function handlePickupAddress(phone, text, businessId) {
   if (business.has_pickup) lines.push('• 🏪 Retiro en local: Sí');
   lines.push(`• 📍 Dirección: ${address}`);
 
-  return sendMessage(phone,
-    '✅ Configuración de entrega guardada:\n' + lines.join('\n') + '\n\n' + paymentMethodsPrompt()
+  return sendPaymentMethodsList(pc, phone,
+    '✅ Configuración de entrega guardada:\n' + lines.join('\n') + '\n\n**Paso 4 de 7** — ¿Qué métodos de pago aceptás?'
   );
 }
 
 // ── Step 4: Payment Methods ──
 
-function paymentMethodsPrompt() {
-  return '**Paso 4 de 8** — ¿Qué métodos de pago aceptás?\n\n' +
-    '1️⃣ Solo efectivo\n2️⃣ Solo transferencia bancaria\n' +
-    '3️⃣ Ambos (efectivo y transferencia)\n4️⃣ Ambos + seña (depósito parcial por transferencia)';
+const PAYMENT_LIST_SECTIONS = [
+  {
+    title: 'Métodos de pago',
+    rows: [
+      { id: '1', title: 'Solo efectivo' },
+      { id: '2', title: 'Solo transferencia' },
+      { id: '3', title: 'Efectivo y transferencia' },
+      { id: '4', title: 'Ambos + seña', description: 'Depósito parcial por transferencia' },
+    ],
+  },
+];
+
+function sendPaymentMethodsList(pc, phone, header) {
+  return sendList(pc, phone, header, 'Elegir método', PAYMENT_LIST_SECTIONS);
 }
 
-async function handlePaymentMethods(phone, text, businessId) {
+async function handlePaymentMethods(pc, phone, text, businessId) {
   const selected = PAYMENT_OPTIONS[text.trim()];
   if (!selected) {
-    return sendMessage(phone,
-      '⚠️ Elegí una opción del 1 al 4:\n\n' +
-      '1️⃣ Solo efectivo\n2️⃣ Solo transferencia bancaria\n' +
-      '3️⃣ Ambos (efectivo y transferencia)\n4️⃣ Ambos + seña (depósito parcial por transferencia)'
-    );
+    return sendPaymentMethodsList(pc, phone, '⚠️ Elegí una opción:');
   }
 
   const { label, ...fields } = selected;
@@ -250,75 +284,81 @@ async function handlePaymentMethods(phone, text, businessId) {
   // If option 4 (with deposit), ask for percentage
   if (text.trim() === '4') {
     await db.updateUserStep(phone, STEPS.DEPOSIT_PERCENT);
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       `✅ Métodos de pago: *${label}*\n\n` +
       '¿Qué porcentaje de seña pedís? (ej: 30, 50)\n' +
       'Esto es lo que el cliente paga por adelantado via transferencia.'
     );
   }
 
-  return advanceAfterPayment(phone, businessId, label);
+  return advanceAfterPayment(pc, phone, businessId, label);
 }
 
-async function handleDepositPercent(phone, text, businessId) {
+async function handleDepositPercent(pc, phone, text, businessId) {
   const num = parseInt(text.trim(), 10);
   if (isNaN(num) || num < 1 || num > 100) {
-    return sendMessage(phone, '⚠️ Ingresá un número entre 1 y 100 (ej: 30, 50):');
+    return sendMessage(pc, phone, '⚠️ Ingresá un número entre 1 y 100 (ej: 30, 50):');
   }
 
   await db.updateBusiness(businessId, { deposit_percent: num });
   const business = await db.getBusinessByPhone(phone);
   const label = getPaymentLabel(business);
-  return advanceAfterPayment(phone, businessId, label);
+  return advanceAfterPayment(pc, phone, businessId, label);
 }
 
-async function advanceAfterPayment(phone, businessId, label) {
+async function advanceAfterPayment(pc, phone, businessId, label) {
   const business = await db.getBusinessByPhone(phone);
 
   if (business.has_delivery) {
     await db.updateUserStep(phone, STEPS.DELIVERY_ZONES);
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       `✅ Métodos de pago guardados: *${label}*\n\n` +
-      '**Paso 5 de 8** — Escribí tus zonas de delivery con el precio de cada una.\n' +
+      '**Paso 5 de 7** — Escribí tus zonas de delivery con el precio de cada una.\n' +
       'Ej: Centro $500, Norte $800, Macrocentro $600'
     );
   }
 
   await db.updateUserStep(phone, STEPS.BANK_DATA);
-  return sendMessage(phone, `✅ Métodos de pago guardados: *${label}*\n\n` + bankDataPrompt());
+  return sendMessage(pc, phone, `✅ Métodos de pago guardados: *${label}*\n\n` + bankDataPrompt());
 }
 
 // ── Step 5: Delivery Zones (AI) ──
 
-async function handleDeliveryZones(phone, text, businessId) {
+async function handleDeliveryZones(pc, phone, text, businessId) {
   const zones = await parseZones(text);
   if (!zones) {
-    return sendMessage(phone, '⚠️ Necesito el precio para cada zona. Probá así:\n"Centro $500, Almagro $600, Caballito $800"');
+    return sendMessage(pc, phone, '⚠️ Necesito el precio para cada zona. Probá así:\n"Centro $500, Almagro $600, Caballito $800"');
   }
   await db.replaceZones(businessId, zones);
   await db.updateUserStep(phone, STEPS.DELIVERY_ZONES_CONFIRM);
   const zoneLines = zones.map((z) => `• ${z.zone_name} — $${z.price}`).join('\n');
-  return sendMessage(phone, `✅ Zonas de delivery guardadas:\n${zoneLines}\n\n¿Está bien? Respondé *SÍ* para continuar o escribí las zonas de nuevo.`);
+  return sendButtons(pc, phone,
+    `✅ Zonas de delivery guardadas:\n${zoneLines}\n\n¿Está bien?`,
+    [
+      { id: 'si', title: 'Sí, continuar' },
+      { id: 'no', title: 'Escribir de nuevo' },
+    ]
+  );
 }
 
-async function handleDeliveryZonesConfirm(phone, text, businessId) {
+async function handleDeliveryZonesConfirm(pc, phone, text, businessId) {
   if (isYes(text)) {
     await db.updateUserStep(phone, STEPS.BANK_DATA);
-    return sendMessage(phone, bankDataPrompt());
+    return sendMessage(pc, phone, bankDataPrompt());
   }
   await db.updateUserStep(phone, STEPS.DELIVERY_ZONES);
-  return handleDeliveryZones(phone, text, businessId);
+  return handleDeliveryZones(pc, phone, text, businessId);
 }
 
 // ── Step 6: Bank Data (AI) ──
 
 function bankDataPrompt() {
-  return '**Paso 6 de 8** — Necesito tus datos bancarios para los cobros:\n• Alias\n• CBU/CVU\n• Titular de la cuenta';
+  return '**Paso 6 de 7** — Necesito tus datos bancarios para los cobros:\n• Alias\n• CBU/CVU\n• Titular de la cuenta';
 }
 
-async function handleBankData(phone, text, businessId) {
+async function handleBankData(pc, phone, text, businessId) {
   const result = await parseBankData(text);
-  if (!result) return sendMessage(phone, '⚠️ No pude interpretar los datos. Enviá todos los datos juntos:\nAlias, CBU/CVU y Titular.');
+  if (!result) return sendMessage(pc, phone, '⚠️ No pude interpretar los datos. Enviá todos los datos juntos:\nAlias, CBU/CVU y Titular.');
 
   const missing = [];
   if (!result.alias) missing.push('• Alias');
@@ -326,45 +366,54 @@ async function handleBankData(phone, text, businessId) {
   if (!result.account_holder) missing.push('• Titular de la cuenta');
 
   if (missing.length > 0) {
-    return sendMessage(phone, '⚠️ Faltan datos obligatorios:\n' + missing.join('\n') + '\n\nEnviá todos los datos juntos:\nAlias, CBU/CVU y Titular.');
+    return sendMessage(pc, phone, '⚠️ Faltan datos obligatorios:\n' + missing.join('\n') + '\n\nEnviá todos los datos juntos:\nAlias, CBU/CVU y Titular.');
   }
 
   await db.upsertBankDetails(businessId, result);
   await db.updateUserStep(phone, STEPS.BANK_DATA_CONFIRM);
 
-  return sendMessage(phone,
+  return sendButtons(pc, phone,
     '✅ Datos bancarios guardados:\n' +
     `• Alias: ${result.alias}\n• CBU: ${result.cbu}\n• Titular: ${result.account_holder}\n\n` +
-    '¿Está bien? Respondé *SÍ* para continuar o escribí los datos de nuevo.'
+    '¿Está bien?',
+    [
+      { id: 'si', title: 'Sí, continuar' },
+      { id: 'no', title: 'Escribir de nuevo' },
+    ]
   );
 }
 
-async function handleBankDataConfirm(phone, text, businessId) {
+async function handleBankDataConfirm(pc, phone, text, businessId) {
   if (isYes(text)) {
-    await db.updateUserStep(phone, STEPS.PRODUCTS);
-    return sendMessage(phone,
-      '**Paso 7 de 8** — Ahora vamos a cargar tu menú.\n' +
-      'Describí tus productos y yo los organizo.\n' +
-      'Ej: "Pizza Muzzarella grande $5500, muzzarella y salsa de tomate, categoría Pizzas"\n\n' +
-      'Cuando termines, escribí *LISTO*.'
+    await db.updateUserStep(phone, STEPS.REVIEW);
+    return sendButtons(pc, phone, await buildReviewSummary(businessId),
+      [
+        { id: 'CONFIRMAR', title: 'Confirmar' },
+        { id: 'EDITAR', title: 'Editar' },
+      ]
     );
   }
   await db.updateUserStep(phone, STEPS.BANK_DATA);
-  return handleBankData(phone, text, businessId);
+  return handleBankData(pc, phone, text, businessId);
 }
 
 // ── Step 7: Products (AI + loop) ──
 
-async function handleProducts(phone, text, businessId) {
+async function handleProducts(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'LISTO') {
     const products = await db.getProductsByBusiness(businessId);
     if (products.length === 0) {
-      return sendMessage(phone, '⚠️ Necesitás cargar al menos un producto antes de continuar.\nDescribí tus productos o escribí *LISTO* cuando termines.');
+      return sendMessage(pc, phone, '⚠️ Necesitás cargar al menos un producto antes de continuar.\nDescribí tus productos o escribí *LISTO* cuando termines.');
     }
     await db.updateUserStep(phone, STEPS.REVIEW);
-    return sendMessage(phone, await buildReviewSummary(businessId));
+    return sendButtons(pc, phone, await buildReviewSummary(businessId),
+      [
+        { id: 'CONFIRMAR', title: 'Confirmar' },
+        { id: 'EDITAR', title: 'Editar' },
+      ]
+    );
   }
-  return addProductsFromText(phone, text, businessId, 'Seguí agregando o escribí *LISTO*.');
+  return addProductsFromText(pc, phone, text, businessId, 'Seguí agregando o escribí *LISTO*.');
 }
 
 // ── Step 8: Review & Activate ──
@@ -375,7 +424,7 @@ async function buildReviewSummary(businessId) {
   const bank = await db.getBankDetails(businessId);
   const products = await db.getProductsByBusiness(businessId);
 
-  const lines = ['📋 **Paso 8 de 8 — Resumen de tu negocio:**\n'];
+  const lines = ['📋 **Paso 7 de 7 — Resumen de tu negocio:**\n'];
   lines.push(`🏪 *${business.business_name}*`);
   lines.push(`⏰ ${business.business_hours}`);
   if (business.business_address) lines.push(`📍 ${business.business_address}`);
@@ -396,33 +445,72 @@ async function buildReviewSummary(businessId) {
     for (const [cat, items] of Object.entries(grouped)) {
       lines.push(`*${cat}:* ${items.map((i) => `${i.name} $${i.price}`).join(', ')}`);
     }
+  } else {
+    lines.push('\n📦 *Menú:* Pendiente — el administrador de la plataforma importará tus productos desde el catálogo de WhatsApp. Te avisaremos cuando estén listos.');
   }
 
   lines.push('\n¿Está todo bien?');
-  lines.push('Respondé *CONFIRMAR* para activar o *EDITAR* para modificar algo.');
   return lines.join('\n');
 }
 
-async function handleReview(phone, text, businessId) {
+async function handleReview(pc, phone, text, businessId) {
   const normalized = text.trim().toUpperCase();
 
   if (normalized === 'CONFIRMAR') {
-    await db.updateBusiness(businessId, { is_active: true });
-    await db.updateUserStep(phone, STEPS.COMPLETED);
     const business = await db.getBusinessByPhone(phone);
-    return sendMessage(phone,
-      '🎉 *¡Tu negocio está activo!*\n\n' +
-      `${business.business_name} ya está listo para recibir pedidos.\n\n` +
-      'Podés modificar tu configuración en cualquier momento.\nEscribí *AYUDA* para ver los comandos disponibles.'
+
+    // Auto-sync catalog from Meta
+    let syncResult = null;
+    if (business.phone_number_id) {
+      const phoneConfig = await db.getPhoneConfigById(business.phone_number_id);
+      if (phoneConfig?.catalogId && phoneConfig?.token) {
+        try {
+          await sendMessage(pc, phone, '⏳ Importando productos desde tu catálogo de WhatsApp...');
+          syncResult = await syncCatalogToDatabase(businessId, phoneConfig.token, phoneConfig.catalogId);
+          console.log(`📦 Catalog sync: ${syncResult.inserted} inserted, ${syncResult.updated} linked, ${syncResult.skipped} skipped`);
+        } catch (error) {
+          console.error('📦 Catalog sync failed:', error.message);
+        }
+      }
+    }
+
+    if (syncResult && syncResult.total > 0) {
+      // Products imported — activate business
+      await db.updateBusiness(businessId, { is_active: true });
+      await db.updateUserStep(phone, STEPS.COMPLETED);
+      return sendMessage(pc, phone,
+        '🎉 *¡Tu negocio está activo!*\n\n' +
+        `*${business.business_name}* ya está listo para recibir pedidos.\n\n` +
+        `📦 Se importaron ${syncResult.total} productos desde tu catálogo.\n\n` +
+        '🤖 *Soy tu asistente.* Podés preguntarme lo que necesites de forma natural:\n' +
+        '• "Quiero cambiar el horario"\n' +
+        '• "Cuántos pedidos tengo?"\n' +
+        '• "Cómo agrego un producto?"\n\n' +
+        '📋 Para pausar un producto: *PAUSAR PRODUCTO*\n' +
+        '📋 Para confirmar un pago: *CONFIRMAR PAGO #N*\n\n' +
+        'Escribí *AYUDA* en cualquier momento para ver más opciones.'
+      );
+    }
+
+    // No products synced — keep inactive, wait for manual sync
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone,
+      '✅ *¡Configuración completada!*\n\n' +
+      `*${business.business_name}* quedó registrado correctamente.\n\n` +
+      '⚠️ No pudimos importar productos del catálogo automáticamente. ' +
+      'El administrador de la plataforma los importará manualmente. ' +
+      'Te avisaremos cuando tu negocio esté listo para recibir pedidos.\n\n' +
+      '🤖 Mientras tanto, podés preguntarme lo que necesites.\n' +
+      'Escribí *AYUDA* para ver las opciones disponibles.'
     );
   }
 
   if (normalized === 'EDITAR') {
-    return sendMessage(phone, editMenuPrompt());
+    return sendEditMenu(pc, phone);
   }
 
-  // Handle edit selection (1-7)
-  const editMap = { '1': STEPS.BUSINESS_NAME, '2': STEPS.BUSINESS_HOURS, '3': STEPS.DELIVERY_METHOD, '4': STEPS.PAYMENT_METHODS, '5': STEPS.DELIVERY_ZONES, '6': STEPS.BANK_DATA, '7': STEPS.PRODUCTS };
+  // Handle edit selection (1-6)
+  const editMap = { '1': STEPS.BUSINESS_NAME, '2': STEPS.BUSINESS_HOURS, '3': STEPS.DELIVERY_METHOD, '4': STEPS.PAYMENT_METHODS, '5': STEPS.DELIVERY_ZONES, '6': STEPS.BANK_DATA };
   const editPrompts = {
     '1': '¿Cuál es el nuevo nombre de tu negocio?',
     '2': '¿Cuál es tu nuevo horario de atención?\nEj: Lunes a Viernes 11:00-23:00, Sábados 12:00-24:00',
@@ -430,72 +518,118 @@ async function handleReview(phone, text, businessId) {
     '4': '¿Qué métodos de pago aceptás?\n\n1️⃣ Solo efectivo\n2️⃣ Solo transferencia bancaria\n3️⃣ Ambos (efectivo y transferencia)\n4️⃣ Ambos + seña (depósito parcial por transferencia)',
     '5': 'Escribí tus zonas de delivery con el precio de cada una.\nEj: Centro $500, Norte $800, Macrocentro $600',
     '6': 'Necesito tus datos bancarios:\n• Alias\n• CBU/CVU\n• Titular de la cuenta',
-    '7': '📦 Entraste en modo edición de menú.\nEscribí nuevos productos para agregar, o *LISTO* para volver al resumen.',
   };
 
   const option = text.trim();
   if (editMap[option]) {
     await db.updateUserStep(phone, editMap[option]);
-    return sendMessage(phone, editPrompts[option]);
+    return sendMessage(pc, phone, editPrompts[option]);
   }
 
-  return sendMessage(phone, 'Respondé *CONFIRMAR* para activar o *EDITAR* para modificar algo.');
+  return sendButtons(pc, phone, '¿Qué querés hacer?',
+    [
+      { id: 'CONFIRMAR', title: 'Confirmar' },
+      { id: 'EDITAR', title: 'Editar' },
+    ]
+  );
 }
 
-function editMenuPrompt() {
-  return '¿Qué querés modificar?\n\n' +
-    '1️⃣ Nombre\n2️⃣ Horario\n3️⃣ Entrega (delivery/retiro)\n' +
-    '4️⃣ Métodos de pago\n5️⃣ Zonas de delivery\n6️⃣ Datos bancarios\n7️⃣ Menú (productos)';
+function sendEditMenu(pc, phone) {
+  return sendList(pc, phone, '¿Qué querés modificar?', 'Ver opciones', [
+    {
+      title: 'Configuración',
+      rows: [
+        { id: '1', title: 'Nombre' },
+        { id: '2', title: 'Horario' },
+        { id: '3', title: 'Entrega', description: 'Delivery / retiro en local' },
+        { id: '4', title: 'Métodos de pago' },
+        { id: '5', title: 'Zonas de delivery' },
+        { id: '6', title: 'Datos bancarios' },
+      ],
+    },
+  ]);
 }
 
 // ══════════════════════════════════════
 // POST-ONBOARDING COMMAND HANDLER
 // ══════════════════════════════════════
 
-async function handleCommand(phone, text, businessId) {
+async function handleCommand(pc, phone, text, businessId) {
+  // 1. Try exact commands first (order commands with #N need precision)
   const parsed = parseCommand(text);
 
-  if (!parsed) {
-    return sendMessage(phone, '👋 ¡Hola! Escribí *AYUDA* para ver los comandos disponibles.');
+  if (parsed) {
+    const business = await db.getBusinessById(businessId);
+    return executeIntent(pc, phone, parsed.command.toLowerCase(), parsed.args || {}, business, businessId);
   }
 
+  // 2. No exact command matched — use AI to classify intent
   const business = await db.getBusinessById(businessId);
 
-  switch (parsed.command) {
-    case 'AYUDA':
-      return sendMessage(phone, helpText());
+  console.log(`🤖 AI intent classification for: "${text.substring(0, 80)}"`);
+  const { intent, args } = await ai.classifyAdminIntent(text);
+  console.log(`🤖 AI classified intent: ${intent}`, args || '');
 
-    case 'EDIT_NAME': {
+  // 3. Handle AI-classified intents
+  if (intent === 'general_question' || intent === 'help') {
+    const context = await buildBusinessContext(businessId, business);
+    const answer = await ai.answerAdminQuestion(text, context);
+    return sendMessage(pc, phone, answer);
+  }
+
+  if (intent === 'greeting') {
+    return sendMessage(pc, phone,
+      `👋 ¡Hola! Soy tu asistente de *${business.business_name}*.\n\n` +
+      'Preguntame lo que necesites o escribí *AYUDA* para ver ejemplos.'
+    );
+  }
+
+  // Map AI intents to existing actions
+  return executeIntent(pc, phone, intent, args || {}, business, businessId);
+}
+
+/**
+ * Execute a classified intent (from exact command or AI classification).
+ */
+async function executeIntent(pc, phone, intent, args, business, businessId) {
+  switch (intent) {
+    case 'ayuda':
+      return sendMessage(pc, phone, helpText());
+
+    case 'edit_name': {
       await db.updateUserStep(phone, STEPS.EDIT_NAME);
-      return sendMessage(phone, `Tu nombre actual es: *${business.business_name}*\n\nEscribí el nuevo nombre:`);
+      return sendMessage(pc, phone, `Tu nombre actual es: *${business.business_name}*\n\nEscribí el nuevo nombre:`);
     }
-    case 'EDIT_HOURS': {
+    case 'edit_hours': {
       await db.updateUserStep(phone, STEPS.EDIT_HOURS);
-      return sendMessage(phone, `Tu horario actual: *${business.business_hours}*\n\nEscribí el nuevo horario:`);
+      return sendMessage(pc, phone, `Tu horario actual: *${business.business_hours}*\n\nEscribí el nuevo horario:`);
     }
-    case 'EDIT_ADDRESS': {
+    case 'edit_address': {
       await db.updateUserStep(phone, STEPS.EDIT_ADDRESS);
-      return sendMessage(phone, `Tu dirección actual: *${business.business_address || 'No configurada'}*\n\nEscribí la nueva dirección:`);
+      return sendMessage(pc, phone, `Tu dirección actual: *${business.business_address || 'No configurada'}*\n\nEscribí la nueva dirección:`);
     }
-    case 'EDIT_DELIVERY': {
+    case 'edit_delivery': {
       await db.updateUserStep(phone, STEPS.EDIT_DELIVERY);
       const lines = ['Tu configuración actual:'];
       lines.push(`• 🚚 Delivery: ${business.has_delivery ? 'Sí' : 'No'}`);
       lines.push(`• 🏪 Retiro en local: ${business.has_pickup ? 'Sí' : 'No'}`);
       if (business.business_address) lines.push(`• 📍 Dirección: ${business.business_address}`);
-      lines.push('\n¿Cómo entregás los pedidos?\n\n1️⃣ Delivery\n2️⃣ Retiro en local\n3️⃣ Ambos');
-      return sendMessage(phone, lines.join('\n'));
-    }
-    case 'EDIT_PAYMENTS': {
-      await db.updateUserStep(phone, STEPS.EDIT_PAYMENTS);
-      return sendMessage(phone,
-        `Tu configuración actual: *${getPaymentLabel(business)}*\n\n` +
-        '¿Qué métodos de pago aceptás?\n\n' +
-        '1️⃣ Solo efectivo\n2️⃣ Solo transferencia bancaria\n' +
-        '3️⃣ Ambos (efectivo y transferencia)\n4️⃣ Ambos + seña (depósito parcial por transferencia)'
+      lines.push('\n¿Cómo entregás los pedidos?');
+      return sendButtons(pc, phone, lines.join('\n'),
+        [
+          { id: '1', title: 'Delivery' },
+          { id: '2', title: 'Retiro en local' },
+          { id: '3', title: 'Ambos' },
+        ]
       );
     }
-    case 'EDIT_ZONES': {
+    case 'edit_payments': {
+      await db.updateUserStep(phone, STEPS.EDIT_PAYMENTS);
+      return sendPaymentMethodsList(pc, phone,
+        `Tu configuración actual: *${getPaymentLabel(business)}*\n\n¿Qué métodos de pago aceptás?`
+      );
+    }
+    case 'edit_zones': {
       await db.updateUserStep(phone, STEPS.EDIT_ZONES);
       const zones = await db.getZonesByBusiness(businessId);
       let msg = '';
@@ -503,9 +637,9 @@ async function handleCommand(phone, text, businessId) {
         msg = 'Tus zonas actuales:\n' + zones.map((z) => `• ${z.zone_name} — $${z.price}`).join('\n') + '\n\n';
       }
       msg += 'Escribí las zonas de nuevo (esto reemplaza todas las zonas anteriores):';
-      return sendMessage(phone, msg);
+      return sendMessage(pc, phone, msg);
     }
-    case 'EDIT_BANK': {
+    case 'edit_bank': {
       await db.updateUserStep(phone, STEPS.EDIT_BANK);
       const bank = await db.getBankDetails(businessId);
       let msg = '';
@@ -514,146 +648,173 @@ async function handleCommand(phone, text, businessId) {
           `• Alias: ${bank.alias}\n• CBU: ${bank.cbu}\n• Titular: ${bank.account_holder}\n\n`;
       }
       msg += 'Enviá los nuevos datos (alias, CBU/CVU y titular):';
-      return sendMessage(phone, msg);
+      return sendMessage(pc, phone, msg);
     }
-    case 'EDIT_PRODUCTS':
-    case 'ADD_PRODUCT': {
-      await db.updateUserStep(phone, STEPS.EDIT_PRODUCTS);
-      const addMsg = parsed.command === 'ADD_PRODUCT'
-        ? 'Describí los productos que querés agregar.\nEj: "Milanesa napolitana $7500, categoría Platos principales"\n\nCuando termines, escribí *LISTO*.'
-        : await buildProductListForEdit(businessId);
-      return sendMessage(phone, addMsg);
+    case 'sync_catalog': {
+      return handleSyncCatalog(pc, phone, business);
     }
-    case 'DELETE_PRODUCT': {
-      await db.updateUserStep(phone, STEPS.DELETE_PRODUCT);
-      const products = await db.getProductsByBusiness(businessId);
-      if (products.length === 0) {
-        await db.updateUserStep(phone, STEPS.COMPLETED);
-        return sendMessage(phone, '📦 Tu menú está vacío.');
-      }
-      const list = products.map((p, i) => `${i + 1}. ${p.name} — $${p.price} (${p.category || 'General'}) ${p.is_available ? '✔️' : '⏸️'}`).join('\n');
-      return sendMessage(phone, `📦 Tu menú:\n${list}\n\nRespondé con el número del producto a eliminar (ej: *3*):`);
-    }
-    case 'PAUSE_PRODUCT': {
+    case 'pause_product': {
       await db.updateUserStep(phone, STEPS.PAUSE_PRODUCT);
       const products = await db.getProductsByBusiness(businessId);
       if (products.length === 0) {
         await db.updateUserStep(phone, STEPS.COMPLETED);
-        return sendMessage(phone, '📦 Tu menú está vacío.');
+        return sendMessage(pc, phone, '📦 Tu menú está vacío.');
       }
-      const list = products.map((p, i) => `${i + 1}. ${p.name} — $${p.price} (${p.category || 'General'}) ${p.is_available ? '✔️' : '⏸️'}`).join('\n');
-      return sendMessage(phone, `📦 Tu menú:\n${list}\n\nRespondé con el número del producto a pausar/activar:`);
+      if (products.length <= 10) {
+        return sendProductList(pc, phone, products, '📦 ¿Qué producto querés pausar/activar?', 'Elegir producto');
+      }
+      // Too many products for interactive list — ask admin to type the name
+      return sendMessage(pc, phone,
+        '📦 *¿Qué producto querés pausar/activar?*\n\n' +
+        'Escribí el nombre del producto (ej: "pizza muzzarella").\n\n' +
+        'Escribí *CANCELAR* para salir.'
+      );
     }
-    case 'VIEW_MENU':
-      return sendMessage(phone, await buildViewMenu(businessId));
-    case 'VIEW_BUSINESS':
-      return sendMessage(phone, await buildViewBusiness(businessId));
+    case 'view_menu':
+      return sendMessage(pc, phone, await buildViewMenu(businessId));
+    case 'view_business':
+      return sendMessage(pc, phone, await buildViewBusiness(businessId));
 
-    // ── Order management commands (Phase 12) ──
-    case 'VIEW_ORDERS':
-      return handleViewOrders(phone, businessId);
-    case 'VIEW_ORDER':
-      return handleViewOrder(phone, businessId, parsed.args.orderNumber);
-    case 'ORDER_STATUS':
-      return handleOrderStatus(phone, businessId, parsed.args.orderNumber, parsed.args.status);
-    case 'CONFIRM_PAYMENT':
-      return handleConfirmPayment(phone, businessId, parsed.args.orderNumber);
-    case 'REJECT_ORDER':
-      return handleRejectOrder(phone, businessId, parsed.args.orderNumber, parsed.args.reason);
-    case 'SALES_SUMMARY':
-      return handleSalesSummary(phone, businessId, parsed.args.period);
+    // ── Order management commands ──
+    case 'view_orders':
+      return handleViewOrders(pc, phone, businessId);
+    case 'view_order':
+      return handleViewOrder(pc, phone, businessId, args.orderNumber);
+    case 'order_status':
+      return handleOrderStatus(pc, phone, businessId, args.orderNumber, args.status);
+    case 'confirm_payment':
+      return handleConfirmPayment(pc, phone, businessId, args.orderNumber);
+    case 'reject_order':
+      return handleRejectOrder(pc, phone, businessId, args.orderNumber, args.reason);
+    case 'sales_summary': {
+      const period = args.period || 'hoy';
+      return handleSalesSummary(pc, phone, businessId, period);
+    }
 
-    default:
-      return sendMessage(phone, '👋 ¡Hola! Escribí *AYUDA* para ver los comandos disponibles.');
+    default: {
+      // Unknown intent — answer as general question
+      const context = await buildBusinessContext(businessId, business);
+      const answer = await ai.answerAdminQuestion('', context);
+      return sendMessage(pc, phone, answer);
+    }
   }
+}
+
+/**
+ * Build business context string for AI general question handler.
+ */
+async function buildBusinessContext(businessId, business) {
+  const zones = await db.getZonesByBusiness(businessId);
+  const bank = await db.getBankDetails(businessId);
+  const products = await db.getProductsByBusiness(businessId);
+  const active = products.filter((p) => p.is_available).length;
+  const paused = products.filter((p) => !p.is_available).length;
+
+  const lines = [];
+  lines.push(`Nombre: ${business.business_name}`);
+  lines.push(`Horario: ${business.business_hours}`);
+  if (business.business_address) lines.push(`Dirección: ${business.business_address}`);
+  lines.push(`Delivery: ${business.has_delivery ? 'Sí' : 'No'}`);
+  lines.push(`Retiro en local: ${business.has_pickup ? 'Sí' : 'No'}`);
+  if (zones.length > 0) {
+    lines.push(`Zonas de delivery: ${zones.map((z) => `${z.zone_name} $${z.price}`).join(', ')}`);
+  }
+  lines.push(`Pagos: ${getPaymentLabel(business)}`);
+  if (bank) lines.push(`Banco: Alias ${bank.alias}, Titular ${bank.account_holder}`);
+  lines.push(`Productos: ${active} activos, ${paused} pausados`);
+  lines.push(`Estado: ${business.is_active ? 'Activo' : 'Inactivo'}`);
+
+  return lines.join('\n');
 }
 
 // ══════════════════════════════════════
 // EDIT-MODE STEP HANDLERS
 // ══════════════════════════════════════
 
-async function handleEditName(phone, text, businessId) {
+async function handleEditName(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   if (!text || text.trim().length === 0) {
-    return sendMessage(phone, '⚠️ El nombre no puede estar vacío. Escribí el nuevo nombre o *CANCELAR* para salir.');
+    return sendMessage(pc, phone, '⚠️ El nombre no puede estar vacío. Escribí el nuevo nombre o *CANCELAR* para salir.');
   }
   const name = text.trim();
   await db.updateBusiness(businessId, { business_name: name });
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone, `✅ Nombre actualizado: *${name}*`);
+  return sendMessage(pc, phone, `✅ Nombre actualizado: *${name}*`);
 }
 
-async function handleEditHours(phone, text, businessId) {
+async function handleEditHours(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   const parsed = await parseHours(text);
   if (!parsed) {
-    return sendMessage(phone, '🤔 No pude interpretar el horario. Probá con un formato como:\n"Lunes a Viernes 11:00-23:00, Sábados 12:00-24:00"\n\nO escribí *CANCELAR* para salir.');
+    return sendMessage(pc, phone, '🤔 No pude interpretar el horario. Probá con un formato como:\n"Lunes a Viernes 11:00-23:00, Sábados 12:00-24:00"\n\nO escribí *CANCELAR* para salir.');
   }
   await db.updateBusiness(businessId, { business_hours: parsed });
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone, `✅ Horario actualizado: *${parsed}*`);
+  return sendMessage(pc, phone, `✅ Horario actualizado: *${parsed}*`);
 }
 
-async function handleEditHoursConfirm(phone, text, businessId) {
+async function handleEditHoursConfirm(pc, phone, text, businessId) {
   // Not used in edit mode — edit hours saves directly
-  return handleEditHours(phone, text, businessId);
+  return handleEditHours(pc, phone, text, businessId);
 }
 
-async function handleEditDelivery(phone, text, businessId) {
+async function handleEditDelivery(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   const option = text.trim();
   if (option === '1') {
     await db.updateBusiness(businessId, { has_delivery: true, has_pickup: false });
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '✅ Actualizado: solo delivery (sin retiro en local).');
+    return sendMessage(pc, phone, '✅ Actualizado: solo delivery (sin retiro en local).');
   }
   if (option === '2') {
     await db.updateBusiness(businessId, { has_delivery: false, has_pickup: true });
     await db.updateUserStep(phone, STEPS.EDIT_ADDRESS);
-    return sendMessage(phone, '¿Cuál es la dirección de tu local?');
+    return sendMessage(pc, phone, '¿Cuál es la dirección de tu local?');
   }
   if (option === '3') {
     await db.updateBusiness(businessId, { has_delivery: true, has_pickup: true });
     await db.updateUserStep(phone, STEPS.EDIT_ADDRESS);
-    return sendMessage(phone, '¿Cuál es la dirección de tu local? (para retiro en local)');
+    return sendMessage(pc, phone, '¿Cuál es la dirección de tu local? (para retiro en local)');
   }
-  return sendMessage(phone, '⚠️ Elegí una opción:\n\n1️⃣ Delivery\n2️⃣ Retiro en local\n3️⃣ Ambos\n\nO escribí *CANCELAR* para salir.');
+  return sendButtons(pc, phone, '⚠️ Elegí una opción (o escribí *CANCELAR*):',
+    [
+      { id: '1', title: 'Delivery' },
+      { id: '2', title: 'Retiro en local' },
+      { id: '3', title: 'Ambos' },
+    ]
+  );
 }
 
-async function handleEditAddress(phone, text, businessId) {
+async function handleEditAddress(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   if (!text || text.trim().length === 0) {
-    return sendMessage(phone, '⚠️ La dirección no puede estar vacía. Escribí la dirección o *CANCELAR*.');
+    return sendMessage(pc, phone, '⚠️ La dirección no puede estar vacía. Escribí la dirección o *CANCELAR*.');
   }
   await db.updateBusiness(businessId, { business_address: text.trim() });
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone, `✅ Dirección actualizada: *${text.trim()}*`);
+  return sendMessage(pc, phone, `✅ Dirección actualizada: *${text.trim()}*`);
 }
 
-async function handleEditPayments(phone, text, businessId) {
+async function handleEditPayments(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   const selected = PAYMENT_OPTIONS[text.trim()];
   if (!selected) {
-    return sendMessage(phone,
-      '⚠️ Elegí una opción del 1 al 4:\n\n' +
-      '1️⃣ Solo efectivo\n2️⃣ Solo transferencia bancaria\n' +
-      '3️⃣ Ambos (efectivo y transferencia)\n4️⃣ Ambos + seña (depósito parcial por transferencia)\n\nO escribí *CANCELAR* para salir.'
-    );
+    return sendPaymentMethodsList(pc, phone, '⚠️ Elegí una opción (o escribí *CANCELAR*):');
   }
   const { label, ...fields } = selected;
   await db.updateBusiness(businessId, fields);
@@ -661,7 +822,7 @@ async function handleEditPayments(phone, text, businessId) {
   // If option 4 (with deposit), ask for percentage
   if (text.trim() === '4') {
     await db.updateUserStep(phone, STEPS.EDIT_DEPOSIT_PERCENT);
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       `✅ Métodos de pago: *${label}*\n\n` +
       '¿Qué porcentaje de seña pedís? (ej: 30, 50)\n\nO escribí *CANCELAR* para salir.'
     );
@@ -670,50 +831,50 @@ async function handleEditPayments(phone, text, businessId) {
   // Clear deposit_percent if switching away from option 4
   await db.updateBusiness(businessId, { deposit_percent: null });
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone, `✅ Métodos de pago actualizados: *${label}*`);
+  return sendMessage(pc, phone, `✅ Métodos de pago actualizados: *${label}*`);
 }
 
-async function handleEditDepositPercent(phone, text, businessId) {
+async function handleEditDepositPercent(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   const num = parseInt(text.trim(), 10);
   if (isNaN(num) || num < 1 || num > 100) {
-    return sendMessage(phone, '⚠️ Ingresá un número entre 1 y 100 (ej: 30, 50):\n\nO escribí *CANCELAR* para salir.');
+    return sendMessage(pc, phone, '⚠️ Ingresá un número entre 1 y 100 (ej: 30, 50):\n\nO escribí *CANCELAR* para salir.');
   }
   await db.updateBusiness(businessId, { deposit_percent: num });
   const business = await db.getBusinessById(businessId);
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone, `✅ Métodos de pago actualizados: *${getPaymentLabel(business)}*`);
+  return sendMessage(pc, phone, `✅ Métodos de pago actualizados: *${getPaymentLabel(business)}*`);
 }
 
-async function handleEditZones(phone, text, businessId) {
+async function handleEditZones(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   const zones = await parseZones(text);
   if (!zones) {
-    return sendMessage(phone, '⚠️ Necesito el precio para cada zona. Probá así:\n"Centro $500, Almagro $600, Caballito $800"\n\nO escribí *CANCELAR* para salir.');
+    return sendMessage(pc, phone, '⚠️ Necesito el precio para cada zona. Probá así:\n"Centro $500, Almagro $600, Caballito $800"\n\nO escribí *CANCELAR* para salir.');
   }
   await db.replaceZones(businessId, zones);
   await db.updateUserStep(phone, STEPS.COMPLETED);
   const zoneLines = zones.map((z) => `• ${z.zone_name} — $${z.price}`).join('\n');
-  return sendMessage(phone, `✅ Zonas actualizadas:\n${zoneLines}`);
+  return sendMessage(pc, phone, `✅ Zonas actualizadas:\n${zoneLines}`);
 }
 
-async function handleEditZonesConfirm(phone, text, businessId) {
-  return handleEditZones(phone, text, businessId);
+async function handleEditZonesConfirm(pc, phone, text, businessId) {
+  return handleEditZones(pc, phone, text, businessId);
 }
 
-async function handleEditBank(phone, text, businessId) {
+async function handleEditBank(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Edición cancelada.');
+    return sendMessage(pc, phone, '❌ Edición cancelada.');
   }
   const result = await parseBankData(text);
-  if (!result) return sendMessage(phone, '⚠️ No pude interpretar los datos. Enviá todos los datos juntos:\nAlias, CBU/CVU y Titular.\n\nO escribí *CANCELAR* para salir.');
+  if (!result) return sendMessage(pc, phone, '⚠️ No pude interpretar los datos. Enviá todos los datos juntos:\nAlias, CBU/CVU y Titular.\n\nO escribí *CANCELAR* para salir.');
 
   const missing = [];
   if (!result.alias) missing.push('• Alias');
@@ -721,19 +882,131 @@ async function handleEditBank(phone, text, businessId) {
   if (!result.account_holder) missing.push('• Titular de la cuenta');
 
   if (missing.length > 0) {
-    return sendMessage(phone, '⚠️ Faltan datos obligatorios:\n' + missing.join('\n') + '\n\nEnviá todos los datos juntos:\nAlias, CBU/CVU y Titular.');
+    return sendMessage(pc, phone, '⚠️ Faltan datos obligatorios:\n' + missing.join('\n') + '\n\nEnviá todos los datos juntos:\nAlias, CBU/CVU y Titular.');
   }
 
   await db.upsertBankDetails(businessId, result);
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone,
+  return sendMessage(pc, phone,
     '✅ Datos bancarios actualizados:\n' +
     `• Alias: ${result.alias}\n• CBU: ${result.cbu}\n• Titular: ${result.account_holder}`
   );
 }
 
-async function handleEditBankConfirm(phone, text, businessId) {
-  return handleEditBank(phone, text, businessId);
+async function handleEditBankConfirm(pc, phone, text, businessId) {
+  return handleEditBank(pc, phone, text, businessId);
+}
+
+/**
+ * Send a product list as an interactive list message.
+ * Falls back to text if >10 products (WhatsApp list limit).
+ */
+function sendProductList(pc, phone, products, body, buttonText) {
+  if (products.length <= 10) {
+    const grouped = {};
+    for (const p of products) {
+      const cat = p.category || 'General';
+      if (!grouped[cat]) grouped[cat] = [];
+      grouped[cat].push(p);
+    }
+
+    let index = 0;
+    const sections = Object.entries(grouped).map(([cat, items]) => ({
+      title: cat,
+      rows: items.map((p) => {
+        index++;
+        const status = p.is_available ? '' : ' (pausado)';
+        return {
+          id: String(index),
+          title: p.name.substring(0, 24),
+          description: `$${p.price}${status}`,
+        };
+      }),
+    }));
+
+    return sendList(pc, phone, body, buttonText, sections);
+  }
+
+  // Fallback for large menus
+  const list = products.map((p, i) =>
+    `${i + 1}. ${p.name} — $${p.price} (${p.category || 'General'}) ${p.is_available ? '✔️' : '⏸️'}`
+  ).join('\n');
+  return sendMessage(pc, phone, `${body}\n\n${list}\n\nRespondé con el número:`);
+}
+
+// ── Link Catalog ──
+
+async function sendCatalogLinkList(pc, phone, businessId) {
+  const products = await db.getProductsByBusiness(businessId);
+  if (products.length === 0) {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '📦 Tu menú está vacío. Agregá productos primero.');
+  }
+
+  const unlinked = products.filter((p) => !p.retailer_id);
+  const linked = products.filter((p) => p.retailer_id);
+
+  const lines = ['📦 *Vincular productos al catálogo de WhatsApp:*\n'];
+
+  if (linked.length > 0) {
+    lines.push(`✅ Vinculados (${linked.length}):`);
+    for (const p of linked) {
+      lines.push(`• ${p.name} → ${p.retailer_id}`);
+    }
+    lines.push('');
+  }
+
+  if (unlinked.length > 0) {
+    lines.push(`⏳ Sin vincular (${unlinked.length}):`);
+    for (let i = 0; i < unlinked.length; i++) {
+      lines.push(`${i + 1}. ${unlinked[i].name} — $${unlinked[i].price}`);
+    }
+    lines.push('\nRespondé con el número + Content ID:');
+    lines.push('Ej: *1 f4n9eeoo6o*');
+    lines.push('\nEscribí *LISTO* para salir.');
+  } else {
+    lines.push('✅ Todos los productos están vinculados.');
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+  }
+
+  return sendMessage(pc, phone, lines.join('\n'));
+}
+
+async function handleLinkCatalog(pc, phone, text, businessId) {
+  const normalized = text.trim().toUpperCase();
+
+  if (normalized === 'LISTO' || normalized === 'CANCELAR') {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '✅ Vinculación finalizada.');
+  }
+
+  // Parse: "1 f4n9eeoo6o" (number + retailer_id)
+  const match = text.trim().match(/^(\d+)\s+(\S+)$/);
+  if (!match) {
+    return sendMessage(pc, phone, '⚠️ Formato: número + Content ID\nEj: *1 f4n9eeoo6o*\n\nO escribí *LISTO* para salir.');
+  }
+
+  const products = await db.getProductsByBusiness(businessId);
+  const unlinked = products.filter((p) => !p.retailer_id);
+  const index = parseInt(match[1], 10) - 1;
+  const retailerId = match[2];
+
+  if (index < 0 || index >= unlinked.length) {
+    return sendMessage(pc, phone, `⚠️ Número inválido. Elegí entre 1 y ${unlinked.length}.`);
+  }
+
+  const product = unlinked[index];
+  await db.updateProductRetailerId(product.id, retailerId);
+
+  // Check remaining
+  const remaining = unlinked.length - 1;
+  if (remaining === 0) {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, `✅ *${product.name}* vinculado → ${retailerId}\n\n🎉 ¡Todos los productos están vinculados al catálogo!`);
+  }
+
+  await sendMessage(pc, phone, `✅ *${product.name}* vinculado → ${retailerId}`);
+  return sendCatalogLinkList(pc, phone, businessId);
 }
 
 // ── Edit Products / Add Products ──
@@ -749,13 +1022,13 @@ async function buildProductListForEdit(businessId) {
   return `📦 Tu menú actual:\n${list}\n\n¿Qué querés hacer?\n• Escribí nuevos productos para agregar\n• Respondé *ELIMINAR 3* para borrar un producto (por número)\n• Respondé *LISTO* para salir`;
 }
 
-async function handleEditProducts(phone, text, businessId) {
+async function handleEditProducts(pc, phone, text, businessId) {
   const normalized = text.trim().toUpperCase();
 
   if (normalized === 'LISTO' || normalized === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
     const products = await db.getProductsByBusiness(businessId);
-    return sendMessage(phone, `✅ Menú actualizado. Tu menú tiene ${products.length} productos.`);
+    return sendMessage(pc, phone, `✅ Menú actualizado. Tu menú tiene ${products.length} productos.`);
   }
 
   // Handle ELIMINAR N
@@ -764,61 +1037,202 @@ async function handleEditProducts(phone, text, businessId) {
     const products = await db.getProductsByBusiness(businessId);
     const index = parseInt(deleteMatch[1], 10) - 1;
     if (index < 0 || index >= products.length) {
-      return sendMessage(phone, `⚠️ Número inválido. Elegí entre 1 y ${products.length}.`);
+      return sendMessage(pc, phone, `⚠️ Número inválido. Elegí entre 1 y ${products.length}.`);
     }
     const product = products[index];
     await db.deleteProduct(product.id);
-    return sendMessage(phone, `✅ *${product.name}* eliminada del menú.\n\n` + await buildProductListForEdit(businessId));
+    return sendMessage(pc, phone, `✅ *${product.name}* eliminada del menú.\n\n` + await buildProductListForEdit(businessId));
   }
 
   // Try to add products with AI
-  return addProductsFromText(phone, text, businessId, 'Seguí editando o escribí *LISTO* para salir.');
+  return addProductsFromText(pc, phone, text, businessId, 'Seguí editando o escribí *LISTO* para salir.');
 }
 
 // ── Delete Product (by number) ──
 
-async function handleDeleteProduct(phone, text, businessId) {
+async function handleDeleteProduct(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Operación cancelada.');
+    return sendMessage(pc, phone, '❌ Operación cancelada.');
   }
 
   const num = parseInt(text.trim(), 10);
   const products = await db.getProductsByBusiness(businessId);
 
   if (isNaN(num) || num < 1 || num > products.length) {
-    return sendMessage(phone, `⚠️ Respondé con un número del 1 al ${products.length}, o *CANCELAR*.`);
+    return sendMessage(pc, phone, `⚠️ Respondé con un número del 1 al ${products.length}, o *CANCELAR*.`);
   }
 
   const product = products[num - 1];
   await db.deleteProduct(product.id);
   await db.updateUserStep(phone, STEPS.COMPLETED);
-  return sendMessage(phone, `✅ *${product.name}* eliminada del menú.`);
+  return sendMessage(pc, phone, `✅ *${product.name}* eliminada del menú.`);
 }
 
 // ── Pause Product (by number) ──
 
-async function handlePauseProduct(phone, text, businessId) {
+async function handlePauseProduct(pc, phone, text, businessId) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(phone, '❌ Operación cancelada.');
+    return sendMessage(pc, phone, '❌ Operación cancelada.');
   }
 
-  const num = parseInt(text.trim(), 10);
   const products = await db.getProductsByBusiness(businessId);
+  let selected = null;
 
-  if (isNaN(num) || num < 1 || num > products.length) {
-    return sendMessage(phone, `⚠️ Respondé con un número del 1 al ${products.length}, o *CANCELAR*.`);
+  // Try number selection first (from interactive list, ≤10 products)
+  const num = parseInt(text.trim(), 10);
+  if (!isNaN(num) && num >= 1 && num <= products.length) {
+    selected = products[num - 1];
   }
 
-  const product = products[num - 1];
-  const nowAvailable = await db.toggleProductAvailability(product.id);
+  // Text input — fuzzy match by name (for large menus)
+  if (!selected) {
+    const input = text.trim().toLowerCase();
+    selected = products.find((p) => p.name.toLowerCase() === input)
+      || products.find((p) => p.name.toLowerCase().includes(input))
+      || products.find((p) => input.includes(p.name.toLowerCase()));
+  }
+
+  if (!selected) {
+    if (products.length <= 10) {
+      return sendMessage(pc, phone, `⚠️ Respondé con un número del 1 al ${products.length}, o *CANCELAR*.`);
+    }
+    return sendMessage(pc, phone,
+      '⚠️ No encontré ese producto.\n\n' +
+      'Escribí el nombre tal como aparece en tu menú (ej: "pizza muzzarella").\n' +
+      'Escribí *CANCELAR* para salir.'
+    );
+  }
+
+  // Product is currently paused → reactivate directly (no need to ask)
+  if (!selected.is_available) {
+    return reactivateProduct(pc, phone, selected, businessId);
+  }
+
+  // Product is active → ask what to do
+  await db.updateUserStep(phone, STEPS.PAUSE_PRODUCT_ACTION);
+  pauseProductSelection.set(phone, selected.id);
+
+  return sendButtons(pc, phone,
+    `¿Qué querés hacer con *${selected.name}*?`,
+    [
+      { id: 'OCULTAR', title: 'Ocultar del catálogo' },
+      { id: 'SIN_STOCK', title: 'Mostrar sin stock' },
+      { id: 'CANCELAR', title: 'Cancelar' },
+    ]
+  );
+}
+
+/**
+ * Handle the action choice after selecting a product to pause.
+ */
+async function handlePauseProductAction(pc, phone, text, businessId) {
+  const normalized = text.trim().toUpperCase();
+
+  if (normalized === 'CANCELAR') {
+    pauseProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '❌ Operación cancelada.');
+  }
+
+  const productId = pauseProductSelection.get(phone);
+
+  if (!productId) {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '⚠️ Algo salió mal. Usá *PAUSAR PRODUCTO* de nuevo.');
+  }
+
+  const products = await db.getProductsByBusiness(businessId);
+  const product = products.find((p) => p.id === productId);
+
+  if (!product) {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '⚠️ Producto no encontrado. Usá *PAUSAR PRODUCTO* de nuevo.');
+  }
+
+  if (normalized === 'OCULTAR') {
+    // Hide from catalog + mark unavailable in DB
+    await db.toggleProductAvailability(product.id);
+    pauseProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    await updateCatalogVisibility(product, businessId, 'staging');
+    return sendMessage(pc, phone,
+      `⏸️ *${product.name}* oculto del catálogo.\n` +
+      'Los clientes no lo verán ni en el menú ni en el catálogo.\n\n' +
+      'Para reactivarlo, usá *PAUSAR PRODUCTO* y seleccionalo de nuevo.'
+    );
+  }
+
+  if (normalized === 'SIN_STOCK') {
+    // Mark as out of stock in catalog + unavailable in DB
+    await db.toggleProductAvailability(product.id);
+    pauseProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    await updateCatalogAvailability(product, businessId, 'out of stock');
+    return sendMessage(pc, phone,
+      `⏸️ *${product.name}* marcado como *sin stock*.\n` +
+      'Los clientes lo verán en el catálogo pero no podrán pedirlo.\n\n' +
+      'Para reactivarlo, usá *PAUSAR PRODUCTO* y seleccionalo de nuevo.'
+    );
+  }
+
+  return sendButtons(pc, phone,
+    '⚠️ Elegí una opción:',
+    [
+      { id: 'OCULTAR', title: 'Ocultar del catálogo' },
+      { id: 'SIN_STOCK', title: 'Mostrar sin stock' },
+      { id: 'CANCELAR', title: 'Cancelar' },
+    ]
+  );
+}
+
+/**
+ * Reactivate a paused product — restore in DB + catalog.
+ */
+async function reactivateProduct(pc, phone, product, businessId) {
+  await db.toggleProductAvailability(product.id);
   await db.updateUserStep(phone, STEPS.COMPLETED);
 
-  if (nowAvailable) {
-    return sendMessage(phone, `✅ *${product.name}* reactivado. Ya aparecerá en el menú.`);
+  // Restore in catalog: set visible + in stock
+  await updateCatalogVisibility(product, businessId, 'published');
+  await updateCatalogAvailability(product, businessId, 'in stock');
+
+  return sendMessage(pc, phone,
+    `✅ *${product.name}* reactivado. Ya aparecerá en el menú y en el catálogo.`
+  );
+}
+
+/**
+ * Update product visibility in Meta catalog (published/staging).
+ */
+async function updateCatalogVisibility(product, businessId, visibility) {
+  if (!product.retailer_id) return;
+  try {
+    const business = await db.getBusinessById(businessId);
+    if (!business?.phone_number_id) return;
+    const phoneConfig = await db.getPhoneConfigById(business.phone_number_id);
+    if (!phoneConfig?.catalogId || !phoneConfig?.token) return;
+    await setProductVisibility(phoneConfig.token, phoneConfig.catalogId, product.retailer_id, visibility === 'published');
+  } catch (err) {
+    console.error(`📦 Failed to update catalog visibility for ${product.name}:`, err.message);
   }
-  return sendMessage(phone, `⏸️ *${product.name}* pausado. No aparecerá en el menú para los clientes.\n\nPara reactivarlo, usá *PAUSAR PRODUCTO* y seleccionalo de nuevo.`);
+}
+
+/**
+ * Update product availability in Meta catalog (in stock/out of stock).
+ */
+async function updateCatalogAvailability(product, businessId, availability) {
+  if (!product.retailer_id) return;
+  try {
+    const business = await db.getBusinessById(businessId);
+    if (!business?.phone_number_id) return;
+    const phoneConfig = await db.getPhoneConfigById(business.phone_number_id);
+    if (!phoneConfig?.catalogId || !phoneConfig?.token) return;
+    await setProductAvailability(phoneConfig.token, phoneConfig.catalogId, product.retailer_id, availability);
+  } catch (err) {
+    console.error(`📦 Failed to update catalog availability for ${product.name}:`, err.message);
+  }
 }
 
 // ══════════════════════════════════════
@@ -826,11 +1240,11 @@ async function handlePauseProduct(phone, text, businessId) {
 // ══════════════════════════════════════
 
 // Step 45: VER PEDIDOS — list pending/new orders
-async function handleViewOrders(phone, businessId) {
+async function handleViewOrders(pc, phone, businessId) {
   const orders = await db.getPendingOrders(businessId);
 
   if (orders.length === 0) {
-    return sendMessage(phone, '📦 No hay pedidos pendientes.');
+    return sendMessage(pc, phone, '📦 No hay pedidos pendientes.');
   }
 
   const lines = [`📦 *Pedidos pendientes (${orders.length}):*\n`];
@@ -849,14 +1263,14 @@ async function handleViewOrders(phone, businessId) {
   }
 
   lines.push('\nUsá *VER PEDIDO #N* para ver detalles.');
-  return sendMessage(phone, lines.join('\n'));
+  return sendMessage(pc, phone, lines.join('\n'));
 }
 
 // Step 46: VER PEDIDO #123 — view order details
-async function handleViewOrder(phone, businessId, orderNumber) {
+async function handleViewOrder(pc, phone, businessId, orderNumber) {
   const order = await db.getOrderByNumber(businessId, orderNumber);
   if (!order) {
-    return sendMessage(phone, `⚠️ No encontré el pedido #${orderNumber}.`);
+    return sendMessage(pc, phone, `⚠️ No encontré el pedido #${orderNumber}.`);
   }
 
   const statusLabels = {
@@ -902,14 +1316,14 @@ async function handleViewOrder(phone, businessId, orderNumber) {
   const createdAt = new Date(order.created_at);
   lines.push(`\n🕐 Creado: ${createdAt.toLocaleString('es-AR', { timeZone: config.timezone })}`);
 
-  return sendMessage(phone, lines.join('\n'));
+  return sendMessage(pc, phone, lines.join('\n'));
 }
 
 // Step 47: ESTADO PEDIDO #123 preparando — change order status
-async function handleOrderStatus(phone, businessId, orderNumber, newStatus) {
+async function handleOrderStatus(pc, phone, businessId, orderNumber, newStatus) {
   const validStatuses = ['preparando', 'en_camino', 'entregado', 'cancelado'];
   if (!validStatuses.includes(newStatus)) {
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       `⚠️ Estado inválido: "${newStatus}"\n\n` +
       'Estados válidos: *preparando*, *en_camino*, *entregado*, *cancelado*'
     );
@@ -917,14 +1331,14 @@ async function handleOrderStatus(phone, businessId, orderNumber, newStatus) {
 
   const order = await db.getOrderByNumber(businessId, orderNumber);
   if (!order) {
-    return sendMessage(phone, `⚠️ No encontré el pedido #${orderNumber}.`);
+    return sendMessage(pc, phone, `⚠️ No encontré el pedido #${orderNumber}.`);
   }
 
   if (order.order_status === 'cancelado') {
-    return sendMessage(phone, `⚠️ El pedido #${orderNumber} está cancelado y no se puede modificar.`);
+    return sendMessage(pc, phone, `⚠️ El pedido #${orderNumber} está cancelado y no se puede modificar.`);
   }
   if (order.order_status === 'entregado') {
-    return sendMessage(phone, `⚠️ El pedido #${orderNumber} ya fue entregado.`);
+    return sendMessage(pc, phone, `⚠️ El pedido #${orderNumber} ya fue entregado.`);
   }
 
   await db.updateOrderStatus(order.id, newStatus);
@@ -936,7 +1350,7 @@ async function handleOrderStatus(phone, businessId, orderNumber, newStatus) {
     cancelado: '❌ Cancelado',
   };
 
-  await sendMessage(phone, `✅ Pedido #${orderNumber} actualizado: *${statusLabels[newStatus]}*`);
+  await sendMessage(pc, phone, `✅ Pedido #${orderNumber} actualizado: *${statusLabels[newStatus]}*`);
 
   // Notify customer of status change
   try {
@@ -946,7 +1360,7 @@ async function handleOrderStatus(phone, businessId, orderNumber, newStatus) {
       entregado: '✅ ¡Tu pedido fue entregado! Gracias por tu compra.',
       cancelado: '❌ Tu pedido fue cancelado por el local.',
     };
-    await sendMessage(order.client_phone,
+    await sendMessage(pc, order.client_phone,
       `📦 Pedido #${orderNumber} — ${customerStatusLabels[newStatus]}`
     );
   } catch (error) {
@@ -955,22 +1369,22 @@ async function handleOrderStatus(phone, businessId, orderNumber, newStatus) {
 }
 
 // Step 48: CONFIRMAR PAGO #123 — confirm transfer/deposit received
-async function handleConfirmPayment(phone, businessId, orderNumber) {
+async function handleConfirmPayment(pc, phone, businessId, orderNumber) {
   const order = await db.getOrderByNumber(businessId, orderNumber);
   if (!order) {
-    return sendMessage(phone, `⚠️ No encontré el pedido #${orderNumber}.`);
+    return sendMessage(pc, phone, `⚠️ No encontré el pedido #${orderNumber}.`);
   }
 
   if (order.payment_status === 'confirmed') {
-    return sendMessage(phone, `⚠️ El pago del pedido #${orderNumber} ya está confirmado.`);
+    return sendMessage(pc, phone, `⚠️ El pago del pedido #${orderNumber} ya está confirmado.`);
   }
 
   await db.updatePaymentStatus(order.id, 'confirmed');
-  await sendMessage(phone, `✅ Pago confirmado para el pedido #${orderNumber}.`);
+  await sendMessage(pc, phone, `✅ Pago confirmado para el pedido #${orderNumber}.`);
 
   // Notify customer
   try {
-    await sendMessage(order.client_phone,
+    await sendMessage(pc, order.client_phone,
       `✅ Pedido #${orderNumber} — ¡Tu pago fue confirmado! Gracias.`
     );
   } catch (error) {
@@ -979,21 +1393,21 @@ async function handleConfirmPayment(phone, businessId, orderNumber) {
 }
 
 // Step 49: RECHAZAR PEDIDO #123 — reject/cancel with optional reason
-async function handleRejectOrder(phone, businessId, orderNumber, reason) {
+async function handleRejectOrder(pc, phone, businessId, orderNumber, reason) {
   const order = await db.getOrderByNumber(businessId, orderNumber);
   if (!order) {
-    return sendMessage(phone, `⚠️ No encontré el pedido #${orderNumber}.`);
+    return sendMessage(pc, phone, `⚠️ No encontré el pedido #${orderNumber}.`);
   }
 
   if (order.order_status === 'cancelado') {
-    return sendMessage(phone, `⚠️ El pedido #${orderNumber} ya está cancelado.`);
+    return sendMessage(pc, phone, `⚠️ El pedido #${orderNumber} ya está cancelado.`);
   }
   if (order.order_status === 'entregado') {
-    return sendMessage(phone, `⚠️ El pedido #${orderNumber} ya fue entregado y no se puede rechazar.`);
+    return sendMessage(pc, phone, `⚠️ El pedido #${orderNumber} ya fue entregado y no se puede rechazar.`);
   }
 
   await db.updateOrderStatus(order.id, 'cancelado');
-  await sendMessage(phone, `❌ Pedido #${orderNumber} rechazado.`);
+  await sendMessage(pc, phone, `❌ Pedido #${orderNumber} rechazado.`);
 
   // Notify customer
   try {
@@ -1001,14 +1415,14 @@ async function handleRejectOrder(phone, businessId, orderNumber, reason) {
     if (reason) {
       msg += `\nMotivo: ${reason}`;
     }
-    await sendMessage(order.client_phone, msg);
+    await sendMessage(pc, order.client_phone, msg);
   } catch (error) {
     console.error(`❌ Failed to notify customer about rejection:`, error.message);
   }
 }
 
 // Step 50: VENTAS HOY/SEMANA/MES — sales summary
-async function handleSalesSummary(phone, businessId, period) {
+async function handleSalesSummary(pc, phone, businessId, period) {
   const now = new Date();
   // Calculate Argentina time
   const argNow = new Date(now.toLocaleString('en-US', { timeZone: config.timezone }));
@@ -1033,7 +1447,7 @@ async function handleSalesSummary(phone, businessId, period) {
       periodLabel = 'este mes';
       break;
     default:
-      return sendMessage(phone, '⚠️ Usá: *VENTAS HOY*, *VENTAS SEMANA* o *VENTAS MES*');
+      return sendMessage(pc, phone, '⚠️ Usá: *VENTAS HOY*, *VENTAS SEMANA* o *VENTAS MES*');
   }
 
   const summary = await db.getSalesSummary(businessId, since);
@@ -1051,7 +1465,40 @@ async function handleSalesSummary(phone, businessId, period) {
     lines.push(`💵 En efectivo: $${formatPrice(summary.cashRevenue)}`);
   }
 
-  return sendMessage(phone, lines.join('\n'));
+  return sendMessage(pc, phone, lines.join('\n'));
+}
+
+// Step: SINCRONIZAR — re-sync products from Meta catalog
+async function handleSyncCatalog(pc, phone, business) {
+  if (!business.phone_number_id) {
+    return sendMessage(pc, phone, '⚠️ Tu negocio no tiene un número de WhatsApp vinculado.');
+  }
+
+  const phoneConfig = await db.getPhoneConfigById(business.phone_number_id);
+  if (!phoneConfig?.catalogId || !phoneConfig?.token) {
+    return sendMessage(pc, phone, '⚠️ No se encontró el catálogo o el token. Contactá al administrador de la plataforma.');
+  }
+
+  await sendMessage(pc, phone, '⏳ Sincronizando productos desde tu catálogo de WhatsApp...');
+
+  try {
+    const result = await syncCatalogToDatabase(business.id, phoneConfig.token, phoneConfig.catalogId);
+
+    if (result.total === 0) {
+      return sendMessage(pc, phone, '⚠️ No se encontraron productos en el catálogo. Verificá que tu catálogo tenga productos en Commerce Manager.');
+    }
+
+    const lines = ['✅ *Catálogo sincronizado*\n'];
+    if (result.inserted > 0) lines.push(`📦 Nuevos: ${result.inserted}`);
+    if (result.updated > 0) lines.push(`🔗 Vinculados: ${result.updated}`);
+    if (result.skipped > 0) lines.push(`⏭️ Ya existían: ${result.skipped}`);
+    lines.push(`\n📋 Total: ${result.total} productos en tu menú.`);
+
+    return sendMessage(pc, phone, lines.join('\n'));
+  } catch (error) {
+    console.error('📦 Catalog sync failed:', error.message);
+    return sendMessage(pc, phone, '❌ Error al sincronizar el catálogo. Contactá al administrador de la plataforma.');
+  }
 }
 
 // ══════════════════════════════════════
@@ -1059,28 +1506,21 @@ async function handleSalesSummary(phone, businessId, period) {
 // ══════════════════════════════════════
 
 function helpText() {
-  return '📖 *Comandos disponibles:*\n\n' +
-    '*Configuración:*\n' +
-    '`EDITAR NOMBRE` — Cambiar nombre del negocio\n' +
-    '`EDITAR HORARIO` — Cambiar horario\n' +
-    '`EDITAR DIRECCIÓN` — Cambiar dirección\n' +
-    '`EDITAR ENTREGA` — Cambiar delivery/retiro\n' +
-    '`EDITAR PAGOS` — Cambiar métodos de pago\n' +
-    '`EDITAR ZONAS` — Cambiar zonas y precios\n' +
-    '`EDITAR BANCO` — Cambiar datos bancarios\n\n' +
-    '*Menú:*\n' +
-    '`AGREGAR PRODUCTO` — Agregar productos al menú\n' +
-    '`ELIMINAR PRODUCTO` — Eliminar un producto\n' +
-    '`PAUSAR PRODUCTO` — Pausar/activar un producto\n' +
-    '`VER MENÚ` — Ver tu menú actual\n' +
-    '`VER NEGOCIO` — Ver resumen del negocio\n\n' +
-    '*Pedidos:*\n' +
-    '`VER PEDIDOS` — Ver pedidos pendientes\n' +
-    '`VER PEDIDO #123` — Ver detalle de un pedido\n' +
-    '`ESTADO PEDIDO #123 preparando` — Cambiar estado\n' +
-    '`CONFIRMAR PAGO #123` — Confirmar transferencia\n' +
-    '`RECHAZAR PEDIDO #123` — Rechazar pedido\n' +
-    '`VENTAS HOY` / `SEMANA` / `MES` — Resumen de ventas';
+  return '🤖 *¡Soy tu asistente!*\n\n' +
+    'Podés escribirme lo que necesites de forma natural, por ejemplo:\n\n' +
+    '💬 *Preguntame cosas como:*\n' +
+    '• "Quiero cambiar el horario"\n' +
+    '• "Cuántos pedidos tengo hoy?"\n' +
+    '• "Cuánto vendí esta semana?"\n' +
+    '• "Cómo agrego un producto?"\n' +
+    '• "Quiero ver mi configuración"\n\n' +
+    '📋 *Comandos rápidos:*\n' +
+    '• *PAUSAR PRODUCTO* — Activar/desactivar un producto\n' +
+    '• *SINCRONIZAR* — Actualizar productos del catálogo\n' +
+    '• *CONFIRMAR PAGO #N* — Confirmar pago de un pedido\n' +
+    '• *RECHAZAR PEDIDO #N* — Rechazar un pedido\n' +
+    '• *ESTADO PEDIDO #N preparando* — Cambiar estado\n\n' +
+    '💡 También podés escribir *AYUDA* en cualquier momento para ver este mensaje.';
 }
 
 async function buildViewMenu(businessId) {
@@ -1154,7 +1594,7 @@ function isYes(text) {
 
 async function parseHours(text) {
   try {
-    const result = await ollama.extractBusinessHours(text);
+    const result = await ai.extractBusinessHours(text);
     return result.hours || null;
   } catch {
     return null;
@@ -1163,7 +1603,7 @@ async function parseHours(text) {
 
 async function parseZones(text) {
   try {
-    const result = await ollama.extractDeliveryZones(text);
+    const result = await ai.extractDeliveryZones(text);
     const zones = result.zones || [];
     if (zones.length === 0 || zones.some((z) => !z.zone_name || !z.price)) return null;
     return zones;
@@ -1174,18 +1614,18 @@ async function parseZones(text) {
 
 async function parseBankData(text) {
   try {
-    return await ollama.extractBankData(text);
+    return await ai.extractBankData(text);
   } catch {
     return null;
   }
 }
 
-async function addProductsFromText(phone, text, businessId, continueMsg) {
+async function addProductsFromText(pc, phone, text, businessId, continueMsg) {
   let result;
   try {
-    result = await ollama.extractProducts(text);
+    result = await ai.extractProducts(text);
   } catch {
-    return sendMessage(phone, '⚠️ No pude interpretar los productos. Probá incluyendo el precio, ej:\n"Pizza grande $5500, categoría Pizzas"');
+    return sendMessage(pc, phone, '⚠️ No pude interpretar los productos. Probá incluyendo el precio, ej:\n"Pizza grande $5500, categoría Pizzas"');
   }
 
   const products = (result.products || []).filter((p) => p.name && p.price > 0);
@@ -1194,9 +1634,9 @@ async function addProductsFromText(phone, text, businessId, continueMsg) {
     const noPrice = (result.products || []).filter((p) => p.name && (!p.price || p.price === 0));
     if (noPrice.length > 0) {
       const names = noPrice.map((p) => `• ${p.name} — sin precio`).join('\n');
-      return sendMessage(phone, `⚠️ No pude detectar el precio de estos productos:\n${names}\n\nProbá incluyendo el precio, ej: "Pizza grande $5500"`);
+      return sendMessage(pc, phone, `⚠️ No pude detectar el precio de estos productos:\n${names}\n\nProbá incluyendo el precio, ej: "Pizza grande $5500"`);
     }
-    return sendMessage(phone, '⚠️ No pude extraer ningún producto. Probá con un formato como:\n"Pizza Muzzarella $5500, categoría Pizzas"');
+    return sendMessage(pc, phone, '⚠️ No pude extraer ningún producto. Probá con un formato como:\n"Pizza Muzzarella $5500, categoría Pizzas"');
   }
 
   await db.insertProducts(businessId, products);
@@ -1213,7 +1653,7 @@ async function addProductsFromText(phone, text, businessId, continueMsg) {
   }
   reply += continueMsg;
 
-  return sendMessage(phone, reply);
+  return sendMessage(pc, phone, reply);
 }
 
 module.exports = { processMessage };

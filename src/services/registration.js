@@ -35,11 +35,36 @@ async function tryRegister(phone, text, profileName) {
     };
   }
 
+  // If code is linked to a phone number, validate that number doesn't already have a business
+  if (code.phone_number_id) {
+    const phoneConfig = await db.getPhoneConfigById(code.phone_number_id);
+
+    if (phoneConfig && phoneConfig.businessId) {
+      console.log(`🔑 Phone number ${phoneConfig.metaPhoneNumberId} already has business ${phoneConfig.businessId}`);
+      return {
+        success: false,
+        isCode: true,
+        message: '❌ Este número de WhatsApp ya tiene un negocio registrado. Contactá al administrador del sistema.',
+      };
+    }
+  }
+
   // Valid unused code — register the admin
   await db.markCodeAsUsed(code.id, phone);
   const admin = await db.createAdmin(phone, profileName, code.id);
   const business = await db.createBusiness(phone);
   await db.createUserState(phone, STEPS.BUSINESS_NAME, business.id);
+
+  // Link business to the phone number from the invite code
+  if (code.phone_number_id) {
+    try {
+      await db.linkBusinessToPhoneNumber(code.phone_number_id, business.id);
+      console.log(`🔑 Business ${business.id} linked to phone number ${code.phone_number_id}`);
+    } catch (error) {
+      console.error('🔑 Failed to link business to phone number:', error.message);
+      // Non-critical — registration still succeeds, can be linked manually later
+    }
+  }
 
   return {
     success: true,
@@ -47,7 +72,7 @@ async function tryRegister(phone, text, profileName) {
     admin,
     message:
       '✅ ¡Registro exitoso! Vamos a configurar tu negocio paso a paso.\n\n' +
-      '**Paso 1 de 8** — ¿Cuál es el nombre de tu negocio?',
+      '**Paso 1 de 7** — ¿Cuál es el nombre de tu negocio?',
   };
 }
 

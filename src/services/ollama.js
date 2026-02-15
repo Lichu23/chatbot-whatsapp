@@ -1,4 +1,5 @@
 const { config } = require('../config');
+const groq = require('./groq');
 
 /**
  * Call Ollama's chat API with a system prompt and user message.
@@ -59,40 +60,60 @@ async function chatJSON(systemPrompt, userMessage) {
 
 // ── Extraction Prompts ──
 
-async function extractBusinessHours(userText) {
-  const system = `Sos un asistente que normaliza horarios de atención de restaurantes argentinos.
+const HOURS_SYSTEM_PROMPT = `Sos un asistente que normaliza horarios de atención de restaurantes argentinos.
 El usuario te va a escribir su horario de forma informal.
 Respondé SOLO con un JSON válido con esta estructura:
 {"hours": "Lun-Vie 11:00-23:00, Sáb 12:00-00:00"}
 Usá formato 24hs. Abreviá los días: Lun, Mar, Mié, Jue, Vie, Sáb, Dom.
 Si no podés interpretar el horario, respondé: {"hours": null}`;
 
-  return chatJSON(system, userText);
+async function extractBusinessHours(userText) {
+  if (config.groq.apiKey) {
+    try {
+      return await groq.chatJSON(HOURS_SYSTEM_PROMPT, userText);
+    } catch (err) {
+      console.warn('⚡ Groq failed for extractBusinessHours, falling back to Ollama:', err.message);
+    }
+  }
+  return chatJSON(HOURS_SYSTEM_PROMPT, userText);
 }
 
-async function extractDeliveryZones(userText) {
-  const system = `Sos un asistente que extrae zonas de delivery con precios.
+const ZONES_SYSTEM_PROMPT = `Sos un asistente que extrae zonas de delivery con precios.
 El usuario va a escribir zonas y precios de forma informal (ej: "centro 500 pesos, almagro 600").
 Respondé SOLO con un JSON válido con esta estructura:
 {"zones": [{"zone_name": "Centro", "price": 500}, {"zone_name": "Almagro", "price": 600}]}
 Capitalizá los nombres de las zonas. Los precios son números sin símbolo.
 Si no podés extraer zonas con precios, respondé: {"zones": []}`;
 
-  return chatJSON(system, userText);
+async function extractDeliveryZones(userText) {
+  if (config.groq.apiKey) {
+    try {
+      return await groq.chatJSON(ZONES_SYSTEM_PROMPT, userText);
+    } catch (err) {
+      console.warn('⚡ Groq failed for extractDeliveryZones, falling back to Ollama:', err.message);
+    }
+  }
+  return chatJSON(ZONES_SYSTEM_PROMPT, userText);
 }
 
-async function extractBankData(userText) {
-  const system = `Sos un asistente que extrae datos bancarios argentinos de texto libre.
+const BANK_SYSTEM_PROMPT = `Sos un asistente que extrae datos bancarios argentinos de texto libre.
 El usuario va a escribir su alias, CBU/CVU y nombre del titular.
 Respondé SOLO con un JSON válido con esta estructura:
 {"alias": "mi.alias", "cbu": "0000003100092810733816", "account_holder": "Juan Pérez"}
 Si falta algún campo, poné null en su valor.`;
 
-  return chatJSON(system, userText);
+async function extractBankData(userText) {
+  if (config.groq.apiKey) {
+    try {
+      return await groq.chatJSON(BANK_SYSTEM_PROMPT, userText);
+    } catch (err) {
+      console.warn('⚡ Groq failed for extractBankData, falling back to Ollama:', err.message);
+    }
+  }
+  return chatJSON(BANK_SYSTEM_PROMPT, userText);
 }
 
-async function extractProducts(userText) {
-  const system = `Sos un asistente que extrae productos de menú de restaurante.
+const PRODUCTS_SYSTEM_PROMPT = `Sos un asistente que extrae productos de menú de restaurante.
 El usuario describe productos de forma informal.
 Respondé SOLO con un JSON válido con esta estructura:
 {"products": [{"name": "Pizza Muzzarella", "description": "Con muzzarella y salsa", "price": 5500, "category": "Pizzas"}]}
@@ -102,7 +123,15 @@ Respondé SOLO con un JSON válido con esta estructura:
 - category: categoría capitalizada o "General" si no se menciona
 Si no podés extraer ningún producto, respondé: {"products": []}`;
 
-  return chatJSON(system, userText);
+async function extractProducts(userText) {
+  if (config.groq.apiKey) {
+    try {
+      return await groq.chatJSON(PRODUCTS_SYSTEM_PROMPT, userText);
+    } catch (err) {
+      console.warn('⚡ Groq failed for extractProducts, falling back to Ollama:', err.message);
+    }
+  }
+  return chatJSON(PRODUCTS_SYSTEM_PROMPT, userText);
 }
 
 /**
@@ -135,7 +164,19 @@ REGLAS:
 - Si no podés interpretar nada, respondé: {"items": [], "not_found": []}
 - NO inventes productos que no están en el catálogo`;
 
-  return chatJSON(system, userText);
+  if (config.groq.apiKey) {
+    try {
+      return await groq.chatJSON(system, userText);
+    } catch (err) {
+      console.warn('⚡ Groq failed for extractOrderItems, falling back to Ollama:', err.message);
+    }
+  }
+  try {
+    return await chatJSON(system, userText);
+  } catch (err) {
+    console.error('🤖 ❌ Both Groq and Ollama failed for extractOrderItems:', err.message);
+    return { items: [], not_found: [], ai_unavailable: true };
+  }
 }
 
 module.exports = {

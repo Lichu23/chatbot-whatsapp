@@ -71,6 +71,28 @@ GET /webhook/whatsapp?hub.mode=subscribe&hub.verify_token=YOUR_TOKEN&hub.challen
 
 It must respond with the `hub.challenge` value if the verify token matches.
 
+### CRITICAL: Subscribe your app to the WhatsApp Business Account
+
+> **Without this step, your webhook will be verified but you will NEVER receive incoming messages. There are no error messages or logs — messages simply don't arrive.**
+
+By default, Meta's test WhatsApp Business Account (WABA) is only linked to Meta's internal test app (`WA DevX Webhook Events 1P App`), **not your app**. You must subscribe your app to the WABA via the API:
+
+```bash
+curl -X POST "https://graph.facebook.com/v21.0/{WABA_ID}/subscribed_apps" \
+  -H "Authorization: Bearer {ACCESS_TOKEN}"
+```
+
+Replace `{WABA_ID}` with your WhatsApp Business Account ID (found in the sidebar or webhook payloads as `entry[0].id`).
+
+To verify the subscription worked:
+
+```bash
+curl "https://graph.facebook.com/v21.0/{WABA_ID}/subscribed_apps" \
+  -H "Authorization: Bearer {ACCESS_TOKEN}"
+```
+
+You should see your app name in the response. If you only see `WA DevX Webhook Events 1P App`, your app is **not** subscribed and won't receive webhooks.
+
 ---
 
 ## Step 5: Sending messages

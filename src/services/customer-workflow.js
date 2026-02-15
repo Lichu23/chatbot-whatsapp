@@ -1,46 +1,54 @@
 const db = require('./database');
-const { sendMessage } = require('./twilio');
-const { extractOrderItems } = require('./ollama');
+const { sendMessage, sendButtons, sendList, sendCatalogList } = require('./whatsapp');
+const { extractOrderItems } = require('./ai');
 const { config, CUSTOMER_STEPS } = require('../config');
 
 /**
  * Main customer orchestration — routes customer messages through the ordering flow.
  * Called when a non-admin messages and the business is active.
  */
-async function processCustomerMessage(message, business) {
+async function processCustomerMessage(message, business, phoneConfig) {
+  const pc = phoneConfig || null;
   const { from, text, profileName } = message;
   console.log(`\n🛒 processCustomerMessage: from=${from}, text="${text}", business=${business.business_name}`);
 
   // Check for ESTADO/CANCELAR commands first (work even without state)
   const statusMatch = text.trim().match(/^ESTADO\s+#?(\d+)$/i);
   if (statusMatch) {
-    return handleCustomerStatusCheck(from, parseInt(statusMatch[1], 10), business);
+    return handleCustomerStatusCheck(pc, from, parseInt(statusMatch[1], 10), business);
   }
   const cancelMatch = text.trim().match(/^CANCELAR\s+#?(\d+)$/i);
   if (cancelMatch) {
-    return handleCustomerCancelOrder(from, parseInt(cancelMatch[1], 10), business);
+    return handleCustomerCancelOrder(pc, from, parseInt(cancelMatch[1], 10), business);
+  }
+
+  // Handle native cart orders (WhatsApp Add to Cart checkout)
+  if (message.nativeCart) {
+    console.log('🛒 Native cart order received:', JSON.stringify(message.nativeCart));
+    const existingState = await db.getCustomerState(from, business.id);
+    return handleNativeCartOrder(pc, from, message.nativeCart, business, profileName, existingState);
   }
 
   // Check if customer has an existing state (mid-order)
-  const state = await db.getCustomerState(from);
+  const state = await db.getCustomerState(from, business.id);
 
   if (state) {
     console.log(`🛒 Customer state found: step=${state.current_step}`);
-    return handleCustomerStep(from, text, state, business, profileName);
+    return handleCustomerStep(pc, from, text, state, business, profileName, message);
   }
 
   // New customer — start fresh
   console.log('🛒 New customer — starting order flow');
-  return startCustomerFlow(from, text, business, profileName);
+  return startCustomerFlow(pc, from, text, business, profileName);
 }
 
 /**
  * Start a new customer flow: greet + check hours.
  */
-async function startCustomerFlow(phone, text, business, profileName) {
+async function startCustomerFlow(pc, phone, text, business, profileName) {
   // Check business hours
   if (!isWithinBusinessHours(business.business_hours)) {
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       `🕐 *${business.business_name}* está cerrado en este momento.\n` +
       `⏰ Nuestro horario: ${business.business_hours}\n\n` +
       '¡Volvé cuando estemos abiertos!'
@@ -56,53 +64,59 @@ async function startCustomerFlow(phone, text, business, profileName) {
     delivery_method: null,
   });
 
-  return sendMessage(phone,
+  // If customer typed MENÚ directly, skip greeting and show catalog
+  const normalized = text.trim().toUpperCase();
+  if (normalized === 'MENÚ' || normalized === 'MENU') {
+    return sendCustomerMenu(pc, phone, business.id, business.business_name);
+  }
+
+  return sendMessage(pc, phone,
     `👋 ¡Hola! Bienvenido/a a *${business.business_name}*\n` +
     `⏰ Horario: ${business.business_hours}\n\n` +
-    'Escribí *MENÚ* para ver nuestros productos o decinos directamente qué querés pedir.'
+    'Escribí *MENÚ* para ver nuestros productos o elegí directamente desde el catálogo 🛒'
   );
 }
 
 /**
  * Route customer to the correct step handler.
  */
-async function handleCustomerStep(phone, text, state, business, profileName) {
+async function handleCustomerStep(pc, phone, text, state, business, profileName, message) {
   const { current_step } = state;
 
   // Check for customer commands first (ESTADO #N, CANCELAR #N)
   const statusMatch = text.trim().match(/^ESTADO\s+#?(\d+)$/i);
   if (statusMatch) {
-    return handleCustomerStatusCheck(phone, parseInt(statusMatch[1], 10), business);
+    return handleCustomerStatusCheck(pc, phone, parseInt(statusMatch[1], 10), business);
   }
 
   const cancelMatch = text.trim().match(/^CANCELAR\s+#?(\d+)$/i);
   if (cancelMatch) {
-    return handleCustomerCancelOrder(phone, parseInt(cancelMatch[1], 10), business);
+    return handleCustomerCancelOrder(pc, phone, parseInt(cancelMatch[1], 10), business);
   }
 
   switch (current_step) {
     case CUSTOMER_STEPS.VIEWING_MENU:
-      return handleViewingMenu(phone, text, state, business, profileName);
+      return handleViewingMenu(pc, phone, text, state, business, profileName);
     case CUSTOMER_STEPS.BUILDING_CART:
-      return handleBuildingCart(phone, text, state, business);
+      return handleBuildingCart(pc, phone, text, state, business);
     case CUSTOMER_STEPS.DELIVERY_METHOD:
-      return handleCustomerDeliveryMethod(phone, text, state, business);
+      return handleCustomerDeliveryMethod(pc, phone, text, state, business);
     case CUSTOMER_STEPS.DELIVERY_ZONE:
-      return handleCustomerDeliveryZone(phone, text, state, business);
+      return handleCustomerDeliveryZone(pc, phone, text, state, business);
     case CUSTOMER_STEPS.DELIVERY_ADDRESS:
-      return handleCustomerDeliveryAddress(phone, text, state, business);
+      return handleCustomerDeliveryAddress(pc, phone, text, state, business);
     case CUSTOMER_STEPS.PAYMENT_METHOD:
-      return handleCustomerPaymentMethod(phone, text, state, business);
+      return handleCustomerPaymentMethod(pc, phone, text, state, business);
     case CUSTOMER_STEPS.AWAITING_TRANSFER:
-      return handleAwaitingTransfer(phone, text, state, business);
+      return handleAwaitingTransfer(pc, phone, text, state, business);
     case CUSTOMER_STEPS.ORDER_CONFIRMED:
       // Order already confirmed — treat as new interaction
-      await db.deleteCustomerState(phone);
-      return startCustomerFlow(phone, text, business, profileName);
+      await db.deleteCustomerState(phone, business.id);
+      return startCustomerFlow(pc, phone, text, business, profileName);
 
     default:
-      await db.deleteCustomerState(phone);
-      return startCustomerFlow(phone, text, business, profileName);
+      await db.deleteCustomerState(phone, business.id);
+      return startCustomerFlow(pc, phone, text, business, profileName);
   }
 }
 
@@ -110,28 +124,30 @@ async function handleCustomerStep(phone, text, state, business, profileName) {
 // STEP 1: VIEWING MENU
 // ══════════════════════════════════════
 
-async function handleViewingMenu(phone, text, state, business, profileName) {
+async function handleViewingMenu(pc, phone, text, state, business, profileName) {
   const normalized = text.trim().toUpperCase();
 
   // Show menu
   if (normalized === 'MENÚ' || normalized === 'MENU') {
-    const menuText = await buildCustomerMenu(business.id, business.business_name);
-    return sendMessage(phone, menuText);
+    return sendCustomerMenu(pc, phone, business.id, business.business_name);
+  }
+
+  // Product selected from list menu
+  if (text.startsWith('product_')) {
+    return handleProductFromList(pc, phone, text, state, business);
   }
 
   // Any other text → parse as an order via AI
-  return handleOrderByText(phone, text, state, business);
+  return handleOrderByText(pc, phone, text, state, business);
 }
 
-async function buildCustomerMenu(businessId, businessName) {
+async function sendCustomerMenu(pc, phone, businessId, businessName) {
   const products = await db.getProductsByBusiness(businessId);
   const available = products.filter((p) => p.is_available);
 
   if (available.length === 0) {
-    return '📦 No hay productos disponibles en este momento.';
+    return sendMessage(pc, phone, '📦 No hay productos disponibles en este momento.');
   }
-
-  const lines = [`📦 *Menú de ${businessName}:*\n`];
 
   const grouped = {};
   for (const p of available) {
@@ -140,6 +156,55 @@ async function buildCustomerMenu(businessId, businessName) {
     grouped[cat].push(p);
   }
 
+  // Use catalogId from phoneConfig if available, fallback to global config
+  const catalogId = pc?.catalogId || config.catalog.id;
+
+  // If catalog is configured and products have retailer_ids, send catalog message
+  const catalogProducts = available.filter((p) => p.retailer_id);
+  if (catalogId && catalogProducts.length > 0) {
+    const catalogGrouped = {};
+    for (const p of catalogProducts) {
+      const cat = p.category || 'General';
+      if (!catalogGrouped[cat]) catalogGrouped[cat] = [];
+      catalogGrouped[cat].push(p);
+    }
+
+    const sections = Object.entries(catalogGrouped).map(([cat, items]) => ({
+      title: cat,
+      product_items: items.map((p) => ({ product_retailer_id: p.retailer_id })),
+    }));
+
+    // WhatsApp product_list supports up to 30 products and 10 sections
+    if (sections.length <= 10 && catalogProducts.length <= 30) {
+      return sendCatalogList(pc, phone,
+        `Menú de ${businessName}`,
+        'Elegí lo que quieras y agregalo al carrito 🛒',
+        catalogId,
+        sections
+      );
+    }
+  }
+
+  // Fallback: interactive list (max 10 rows)
+  if (available.length <= 10) {
+    const sections = Object.entries(grouped).map(([cat, items]) => ({
+      title: cat,
+      rows: items.map((p) => ({
+        id: `product_${p.id}`,
+        title: p.name.substring(0, 24),
+        description: `$${p.price}`,
+      })),
+    }));
+
+    return sendList(pc, phone,
+      `📦 *Menú de ${businessName}*\n\nElegí un producto para agregarlo al carrito 🛒`,
+      'Ver menú',
+      sections
+    );
+  }
+
+  // Fallback: text menu for large catalogs
+  const lines = [`📦 *Menú de ${businessName}:*\n`];
   for (const [cat, items] of Object.entries(grouped)) {
     lines.push(`*${cat}:*`);
     for (const p of items) {
@@ -147,22 +212,21 @@ async function buildCustomerMenu(businessId, businessName) {
     }
     lines.push('');
   }
-
-  lines.push('Escribí lo que querés pedir (ej: "2 muzzarella y 1 coca")');
-  return lines.join('\n');
+  lines.push('Elegí lo que quieras y agregalo al carrito 🛒');
+  return sendMessage(pc, phone, lines.join('\n'));
 }
 
 /**
  * AI-powered order parsing — extracts products + quantities from customer free text.
- * Matches against the real product catalog using Ollama.
+ * Matches against the real product catalog using AI.
  */
-async function handleOrderByText(phone, text, state, business) {
+async function handleOrderByText(pc, phone, text, state, business) {
   // Fetch available products for AI matching
   const products = await db.getProductsByBusiness(business.id);
   const available = products.filter((p) => p.is_available);
 
   if (available.length === 0) {
-    return sendMessage(phone, '📦 No hay productos disponibles en este momento.');
+    return sendMessage(pc, phone, '📦 No hay productos disponibles en este momento.');
   }
 
   let result;
@@ -170,7 +234,7 @@ async function handleOrderByText(phone, text, state, business) {
     result = await extractOrderItems(text, available);
   } catch (error) {
     console.error('🤖 ❌ AI order parsing failed:', error.message);
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       '⚠️ No pude interpretar tu pedido.\n\n' +
       'Probá de nuevo con algo como: "2 muzzarella y 1 coca"\n' +
       'O escribí *MENÚ* para ver nuestros productos.'
@@ -186,7 +250,7 @@ async function handleOrderByText(phone, text, state, business) {
       msg += `No tenemos: ${notFound.join(', ')}\n\n`;
     }
     msg += 'Probá de nuevo o escribí *MENÚ* para ver nuestros productos.';
-    return sendMessage(phone, msg);
+    return sendMessage(pc, phone, msg);
   }
 
   // Build cart items with prices from the real catalog
@@ -229,91 +293,33 @@ async function handleOrderByText(phone, text, state, business) {
     msg = `⚠️ No encontré: ${notFound.join(', ')}\n\n` + msg;
   }
 
-  return sendMessage(phone, msg);
+  return sendButtons(pc, phone, msg, CART_BUTTONS);
 }
 
 // ══════════════════════════════════════
 // STEP 2: BUILDING CART
 // ══════════════════════════════════════
 
-async function handleBuildingCart(phone, text, state, business) {
+async function handleBuildingCart(pc, phone, text, state, business) {
   const normalized = text.trim().toUpperCase();
 
   // Cancel order
   if (normalized === 'CANCELAR') {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '❌ Pedido cancelado.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '❌ Pedido cancelado.');
   }
 
   // Continue to delivery step
   if (normalized === 'SEGUIR') {
-    return advanceToDelivery(phone, state, business);
+    return advanceToDelivery(pc, phone, state, business);
   }
 
-  // Remove item (allow optional product name after number, e.g. "QUITAR 1 empanada")
-  const removeMatch = normalized.match(/^QUITAR\s+(\d+)(?:\s+.*)?$/);
-  if (removeMatch) {
-    const index = parseInt(removeMatch[1], 10) - 1;
-    const cart = state.cart || [];
-
-    if (index < 0 || index >= cart.length) {
-      return sendMessage(phone, `⚠️ Número inválido. Elegí entre 1 y ${cart.length}.`);
-    }
-
-    const removed = cart[index];
-    cart.splice(index, 1);
-
-    if (cart.length === 0) {
-      await db.updateCustomerCart(phone, []);
-      await db.updateCustomerStep(phone, CUSTOMER_STEPS.VIEWING_MENU);
-      return sendMessage(phone,
-        `✅ *${removed.name}* eliminado del pedido.\n\n` +
-        '🛒 Tu carrito está vacío.\n' +
-        'Escribí *MENÚ* para ver nuestros productos o decinos qué querés pedir.'
-      );
-    }
-
-    await db.updateCustomerCart(phone, cart);
-    return sendMessage(phone,
-      `✅ *${removed.name}* eliminado del pedido.\n\n` + buildCartDisplay(cart)
-    );
-  }
-
-  // Change quantity (allow optional product name after, e.g. "CAMBIAR 2 A 3 empanadas")
-  const changeMatch = normalized.match(/^CAMBIAR\s+(\d+)\s+A\s+(\d+)(?:\s+.*)?$/);
-  if (changeMatch) {
-    const index = parseInt(changeMatch[1], 10) - 1;
-    const newQty = parseInt(changeMatch[2], 10);
-    const cart = state.cart || [];
-
-    if (index < 0 || index >= cart.length) {
-      return sendMessage(phone, `⚠️ Número inválido. Elegí entre 1 y ${cart.length}.`);
-    }
-    if (newQty < 1) {
-      return sendMessage(phone, '⚠️ La cantidad debe ser al menos 1. Usá *QUITAR* para eliminar.');
-    }
-
-    cart[index].qty = newQty;
-    cart[index].subtotal = cart[index].price * newQty;
-    await db.updateCustomerCart(phone, cart);
-    return sendMessage(phone,
-      `✅ Cantidad actualizada.\n\n` + buildCartDisplay(cart)
-    );
-  }
-
-  // Show menu
-  if (normalized === 'MENÚ' || normalized === 'MENU') {
-    const menuText = await buildCustomerMenu(business.id, business.business_name);
-    return sendMessage(phone, menuText);
-  }
-
-  // Customer wants to add more items
-  if (normalized === 'SÍ' || normalized === 'SI') {
-    return sendMessage(phone, 'Escribí lo que querés agregar:');
-  }
-
-  // Try to parse as additional order via AI
-  return handleOrderByText(phone, text, state, business);
+  // Any other message — remind them to use buttons or reopen their cart
+  return sendButtons(pc, phone,
+    '⚠️ Si querés agregar más productos, abrí tu carrito desde el catálogo y agregá lo que te falte.\n\n' +
+    'Cuando estés listo, tocá *Confirmar pedido*.',
+    CART_BUTTONS
+  );
 }
 
 function buildCartDisplay(cart) {
@@ -328,25 +334,141 @@ function buildCartDisplay(cart) {
   }
 
   lines.push(`\n📋 Subtotal: *$${formatPrice(subtotal)}*`);
-  lines.push('\n¿Querés agregar algo más?');
-  lines.push('• *SÍ* — seguir agregando');
-  lines.push('• *QUITAR 1* — eliminar un item');
-  lines.push('• *CAMBIAR 1 A 3* — cambiar cantidad');
-  lines.push('• *SEGUIR* — confirmar y continuar');
-  lines.push('• *CANCELAR* — cancelar pedido');
+  lines.push('\nPodés agregar más productos desde el catálogo.');
 
   return lines.join('\n');
 }
+
+/**
+ * Handle a native cart order from WhatsApp's built-in cart.
+ * Maps catalog items to DB products and creates the cart directly (no AI needed).
+ */
+async function handleNativeCartOrder(pc, phone, nativeCart, business, profileName, existingState) {
+  // Check business hours
+  if (!isWithinBusinessHours(business.business_hours)) {
+    return sendMessage(pc, phone,
+      `🕐 *${business.business_name}* está cerrado en este momento.\n` +
+      `⏰ Nuestro horario: ${business.business_hours}\n\n` +
+      '¡Volvé cuando estemos abiertos!'
+    );
+  }
+
+  const products = await db.getProductsByBusiness(business.id);
+  const available = products.filter((p) => p.is_available);
+
+  // Start with existing cart if we have one
+  const cart = (existingState?.cart || []).filter((item) => !item._order_context);
+  const notFound = [];
+
+  const paused = [];
+  for (const item of nativeCart.items) {
+    const product = available.find((p) => p.retailer_id === item.product_retailer_id);
+    if (product) {
+      const qty = Math.max(1, Math.round(item.quantity || 1));
+
+      // Merge with existing cart item if present
+      const existing = cart.find((c) => c.product_id === product.id);
+      if (existing) {
+        existing.qty += qty;
+        existing.subtotal = existing.price * existing.qty;
+      } else {
+        cart.push({
+          product_id: product.id,
+          name: product.name,
+          price: Number(product.price),
+          qty,
+          subtotal: Number(product.price) * qty,
+        });
+      }
+    } else {
+      // Check if the product exists but is paused
+      const pausedProduct = products.find((p) => p.retailer_id === item.product_retailer_id && !p.is_available);
+      if (pausedProduct) {
+        paused.push(pausedProduct.name);
+      } else {
+        notFound.push(item.product_retailer_id);
+      }
+    }
+  }
+
+  if (cart.length === 0) {
+    if (paused.length > 0) {
+      return sendMessage(pc, phone, `⚠️ ${paused.join(', ')} no está disponible en este momento.\n\nEscribí *MENÚ* para ver los productos disponibles.`);
+    }
+    return sendMessage(pc, phone, '⚠️ No pudimos procesar tu carrito. Escribí *MENÚ* para ver los productos disponibles.');
+  }
+
+  // Create/update customer state with the merged cart
+  await db.upsertCustomerState(phone, {
+    business_id: business.id,
+    current_step: CUSTOMER_STEPS.BUILDING_CART,
+    cart,
+    selected_zone_id: existingState?.selected_zone_id || null,
+    delivery_method: existingState?.delivery_method || null,
+  });
+
+  let msg = buildCartDisplay(cart);
+  if (paused.length > 0) {
+    msg = `⚠️ No disponible: ${paused.join(', ')}\n\n` + msg;
+  } else if (notFound.length > 0) {
+    msg = `⚠️ Algunos productos no se encontraron.\n\n` + msg;
+  }
+
+  return sendButtons(pc, phone, msg, CART_BUTTONS);
+}
+
+/**
+ * Handle a product selected from the interactive list menu.
+ * Adds 1 unit to the cart without AI parsing.
+ */
+async function handleProductFromList(pc, phone, text, state, business) {
+  const productId = text.replace('product_', '');
+  const products = await db.getProductsByBusiness(business.id);
+  const product = products.find((p) => p.id === productId && p.is_available);
+
+  if (!product) {
+    return sendMessage(pc, phone, '⚠️ Producto no disponible. Escribí *MENÚ* para ver los productos.');
+  }
+
+  const cart = state.cart || [];
+  const existing = cart.find((c) => c.product_id === productId);
+
+  if (existing) {
+    existing.qty += 1;
+    existing.subtotal = existing.price * existing.qty;
+  } else {
+    cart.push({
+      product_id: product.id,
+      name: product.name,
+      price: Number(product.price),
+      qty: 1,
+      subtotal: Number(product.price),
+    });
+  }
+
+  await db.upsertCustomerState(phone, {
+    ...stateFields(state),
+    cart,
+    current_step: CUSTOMER_STEPS.BUILDING_CART,
+  });
+
+  return sendButtons(pc, phone, buildCartDisplay(cart), CART_BUTTONS);
+}
+
+const CART_BUTTONS = [
+  { id: 'SEGUIR', title: 'Confirmar pedido' },
+  { id: 'CANCELAR', title: 'Cancelar' },
+];
 
 // ══════════════════════════════════════
 // STEP 3: DELIVERY METHOD
 // ══════════════════════════════════════
 
-async function advanceToDelivery(phone, state, business) {
+async function advanceToDelivery(pc, phone, state, business) {
   const cart = state.cart || [];
   if (cart.length === 0) {
-    await db.updateCustomerStep(phone, CUSTOMER_STEPS.VIEWING_MENU);
-    return sendMessage(phone,
+    await db.updateCustomerStep(phone, CUSTOMER_STEPS.VIEWING_MENU, business.id);
+    return sendMessage(pc, phone,
       '⚠️ Tu carrito está vacío.\n' +
       'Escribí *MENÚ* para ver nuestros productos o decinos qué querés pedir.'
     );
@@ -357,14 +479,14 @@ async function advanceToDelivery(phone, state, business) {
 
   // Both options
   if (hasDelivery && hasPickup) {
-    await db.updateCustomerStep(phone, CUSTOMER_STEPS.DELIVERY_METHOD);
-    const address = business.business_address ? ` (📍 ${business.business_address})` : '';
-    return sendMessage(phone,
-      '🚚 ¿Cómo querés recibir tu pedido? Seleccioná una opción:\n\n' +
-      '1️⃣ Delivery\n' +
-      `2️⃣ Retiro en local${address}\n\n` +
-      'Escribí *1* o *2* (o el nombre de la opción).\n' +
-      'Escribí *CANCELAR* para cancelar el pedido.'
+    await db.updateCustomerStep(phone, CUSTOMER_STEPS.DELIVERY_METHOD, business.id);
+    const address = business.business_address ? `\n📍 ${business.business_address}` : '';
+    return sendButtons(pc, phone,
+      `🚚 ¿Cómo querés recibir tu pedido?`,
+      [
+        { id: '1', title: 'Delivery' },
+        { id: '2', title: 'Retiro en local' },
+      ]
     );
   }
 
@@ -375,7 +497,7 @@ async function advanceToDelivery(phone, state, business) {
       delivery_method: 'delivery',
       current_step: CUSTOMER_STEPS.DELIVERY_ZONE,
     });
-    return showDeliveryZones(phone, business.id);
+    return showDeliveryZones(pc, phone, business.id);
   }
 
   // Pickup only → skip to payment
@@ -384,16 +506,16 @@ async function advanceToDelivery(phone, state, business) {
     delivery_method: 'pickup',
     current_step: CUSTOMER_STEPS.PAYMENT_METHOD,
   });
-  return showOrderSummaryAndPayment(phone, state, business, 'pickup', null);
+  return showOrderSummaryAndPayment(pc, phone, state, business, 'pickup', null);
 }
 
-async function handleCustomerDeliveryMethod(phone, text, state, business) {
+async function handleCustomerDeliveryMethod(pc, phone, text, state, business) {
   const option = text.trim();
   const normalized = option.toUpperCase();
 
   if (normalized === 'CANCELAR') {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '❌ Pedido cancelado.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '❌ Pedido cancelado.');
   }
 
   // Accept number OR text for delivery
@@ -407,7 +529,7 @@ async function handleCustomerDeliveryMethod(phone, text, state, business) {
       delivery_method: 'delivery',
       current_step: CUSTOMER_STEPS.DELIVERY_ZONE,
     });
-    return showDeliveryZones(phone, business.id);
+    return showDeliveryZones(pc, phone, business.id);
   }
 
   if (isPickup) {
@@ -416,16 +538,16 @@ async function handleCustomerDeliveryMethod(phone, text, state, business) {
       delivery_method: 'pickup',
       current_step: CUSTOMER_STEPS.PAYMENT_METHOD,
     });
-    return showOrderSummaryAndPayment(phone, state, business, 'pickup', null);
+    return showOrderSummaryAndPayment(pc, phone, state, business, 'pickup', null);
   }
 
-  const address = business.business_address ? ` (📍 ${business.business_address})` : '';
-  return sendMessage(phone,
-    '⚠️ Elegí una opción:\n\n' +
-    '1️⃣ Delivery\n' +
-    `2️⃣ Retiro en local${address}\n\n` +
-    'Escribí *1* o *2* (o el nombre de la opción).\n' +
-    'Escribí *CANCELAR* para cancelar el pedido.'
+  const address = business.business_address ? `\n📍 ${business.business_address}` : '';
+  return sendButtons(pc, phone,
+    `⚠️ Elegí una opción:${address}`,
+    [
+      { id: '1', title: 'Delivery' },
+      { id: '2', title: 'Retiro en local' },
+    ]
   );
 }
 
@@ -433,34 +555,40 @@ async function handleCustomerDeliveryMethod(phone, text, state, business) {
 // STEP 4: DELIVERY ZONE
 // ══════════════════════════════════════
 
-async function showDeliveryZones(phone, businessId) {
+async function showDeliveryZones(pc, phone, businessId) {
   const zones = await db.getZonesByBusiness(businessId);
 
   if (zones.length === 0) {
-    return sendMessage(phone, '⚠️ No hay zonas de delivery configuradas. Contactá al local.');
+    return sendMessage(pc, phone, '⚠️ No hay zonas de delivery configuradas. Contactá al local.');
   }
 
-  const lines = ['🚚 *Zonas de delivery:*'];
-  for (let i = 0; i < zones.length; i++) {
-    lines.push(`${i + 1}️⃣ ${zones[i].zone_name} — $${zones[i].price}`);
-  }
-  lines.push('\n¿En qué zona estás? Respondé con el número.');
-  lines.push('Escribí *CANCELAR* para cancelar el pedido.');
-
-  return sendMessage(phone, lines.join('\n'));
+  return sendList(pc, phone,
+    '🚚 ¿En qué zona estás?\n\nEscribí *CANCELAR* para cancelar el pedido.',
+    'Ver zonas',
+    [
+      {
+        title: 'Zonas de delivery',
+        rows: zones.map((z, i) => ({
+          id: String(i + 1),
+          title: z.zone_name,
+          description: `$${z.price}`,
+        })),
+      },
+    ]
+  );
 }
 
-async function handleCustomerDeliveryZone(phone, text, state, business) {
+async function handleCustomerDeliveryZone(pc, phone, text, state, business) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '❌ Pedido cancelado.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '❌ Pedido cancelado.');
   }
 
   const zones = await db.getZonesByBusiness(business.id);
   const num = parseInt(text.trim(), 10);
 
   if (isNaN(num) || num < 1 || num > zones.length) {
-    return sendMessage(phone, `⚠️ Elegí un número del 1 al ${zones.length}.\nEscribí *CANCELAR* para cancelar el pedido.`);
+    return sendMessage(pc, phone, `⚠️ Elegí un número del 1 al ${zones.length}.\nEscribí *CANCELAR* para cancelar el pedido.`);
   }
 
   const selectedZone = zones[num - 1];
@@ -471,40 +599,36 @@ async function handleCustomerDeliveryZone(phone, text, state, business) {
     current_step: CUSTOMER_STEPS.DELIVERY_ADDRESS,
   });
 
-  return sendMessage(phone, '📍 ¿Cuál es tu dirección de entrega?\n\nEscribí *CANCELAR* para cancelar el pedido.');
+  return sendMessage(pc, phone, '📍 Escribí tu dirección de entrega.\nEj: _"San Martín 450, 2do piso B"_\n\nEscribí *CANCELAR* para cancelar el pedido.');
 }
 
 // ══════════════════════════════════════
 // STEP 5: DELIVERY ADDRESS
 // ══════════════════════════════════════
 
-async function handleCustomerDeliveryAddress(phone, text, state, business) {
+async function handleCustomerDeliveryAddress(pc, phone, text, state, business) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '❌ Pedido cancelado.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '❌ Pedido cancelado.');
   }
 
-  if (!text || text.trim().length === 0) {
-    return sendMessage(phone, '⚠️ Necesito tu dirección para el delivery.\nEscribí *CANCELAR* para cancelar el pedido.');
+  if (!text || text.trim().length === 0 || text === '__LOCATION__') {
+    return sendMessage(pc, phone, '⚠️ Necesito tu dirección para el delivery.\n\nEscribí tu dirección, ej: _"San Martín 450, 2do piso B"_\nEscribí *CANCELAR* para cancelar el pedido.');
   }
 
   const address = text.trim();
 
-  // Save address temporarily in state (we'll use it when creating the order)
-  // We store it in cart metadata since customer_states doesn't have an address field
-  // Actually, let's advance to payment and keep the address in the order flow
-  await db.updateCustomerStep(phone, CUSTOMER_STEPS.PAYMENT_METHOD);
+  await db.updateCustomerStep(phone, CUSTOMER_STEPS.PAYMENT_METHOD, business.id);
 
-  // Get updated state with zone
-  const updatedState = await db.getCustomerState(phone);
-  return showOrderSummaryAndPayment(phone, updatedState, business, 'delivery', address);
+  const updatedState = await db.getCustomerState(phone, business.id);
+  return showOrderSummaryAndPayment(pc, phone, updatedState, business, 'delivery', address);
 }
 
 // ══════════════════════════════════════
 // STEP 6: ORDER SUMMARY + PAYMENT
 // ══════════════════════════════════════
 
-async function showOrderSummaryAndPayment(phone, state, business, method, address) {
+async function showOrderSummaryAndPayment(pc, phone, state, business, method, address) {
   const cart = state.cart || [];
   const subtotal = cart.reduce((sum, item) => sum + item.price * item.qty, 0);
 
@@ -543,33 +667,27 @@ async function showOrderSummaryAndPayment(phone, state, business, method, addres
   lines.push(`💰 *Total: $${formatPrice(grandTotal)}*`);
 
   // Build payment options
-  lines.push('\n💳 *¿Cómo querés pagar?*\n');
-
   const paymentOptions = [];
   let optionNum = 1;
 
   if (business.accepts_cash) {
-    const label = method === 'pickup' ? 'Efectivo (pagás al retirar)' : 'Efectivo (pagás al recibir)';
-    paymentOptions.push({ num: optionNum, method: 'cash', label });
-    lines.push(`${optionNum}️⃣ ${label}`);
+    const desc = method === 'pickup' ? 'Pagás al retirar' : 'Pagás al recibir';
+    paymentOptions.push({ num: optionNum, method: 'cash', label: 'Efectivo', description: desc });
     optionNum++;
   }
 
   if (business.accepts_transfer) {
-    paymentOptions.push({ num: optionNum, method: 'transfer', label: `Transferencia bancaria (total: $${formatPrice(grandTotal)})` });
-    lines.push(`${optionNum}️⃣ Transferencia bancaria (total: $${formatPrice(grandTotal)})`);
+    paymentOptions.push({ num: optionNum, method: 'transfer', label: 'Transferencia', description: `Total: $${formatPrice(grandTotal)}` });
     optionNum++;
   }
 
   if (business.accepts_deposit && business.deposit_percent) {
     const depositAmount = Math.ceil(grandTotal * business.deposit_percent / 100);
-    paymentOptions.push({ num: optionNum, method: 'deposit', label: `Seña por transferencia (${business.deposit_percent}%: $${formatPrice(depositAmount)})` });
-    lines.push(`${optionNum}️⃣ Seña por transferencia (${business.deposit_percent}%: $${formatPrice(depositAmount)})`);
+    paymentOptions.push({ num: optionNum, method: 'deposit', label: `Seña ${business.deposit_percent}%`, description: `$${formatPrice(depositAmount)}` });
     optionNum++;
   }
 
   // Store order context in cart metadata for next step
-  // We save address + payment options mapping as extra data
   const orderContext = {
     subtotal,
     delivery_price: deliveryPrice,
@@ -582,19 +700,39 @@ async function showOrderSummaryAndPayment(phone, state, business, method, addres
 
   // Store context in cart (append as last item with special flag)
   const cartWithContext = [...cart, { _order_context: true, ...orderContext }];
-  await db.updateCustomerCart(phone, cartWithContext);
+  await db.updateCustomerCart(phone, cartWithContext, business.id);
 
-  return sendMessage(phone, lines.join('\n'));
+  lines.push('\n💳 *¿Cómo querés pagar?*');
+
+  // If only 1 payment option, use buttons; otherwise use list
+  if (paymentOptions.length === 1) {
+    return sendButtons(pc, phone, lines.join('\n'),
+      [{ id: String(paymentOptions[0].num), title: paymentOptions[0].label }]
+    );
+  }
+
+  return sendList(pc, phone, lines.join('\n'), 'Elegir pago',
+    [
+      {
+        title: 'Métodos de pago',
+        rows: paymentOptions.map((o) => ({
+          id: String(o.num),
+          title: o.label,
+          ...(o.description && { description: o.description }),
+        })),
+      },
+    ]
+  );
 }
 
 // ══════════════════════════════════════
 // STEP 7: PAYMENT METHOD
 // ══════════════════════════════════════
 
-async function handleCustomerPaymentMethod(phone, text, state, business) {
+async function handleCustomerPaymentMethod(pc, phone, text, state, business) {
   if (text.trim().toUpperCase() === 'CANCELAR') {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '❌ Pedido cancelado.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '❌ Pedido cancelado.');
   }
 
   const cart = state.cart || [];
@@ -602,8 +740,8 @@ async function handleCustomerPaymentMethod(phone, text, state, business) {
 
   if (!contextItem) {
     // Lost context — restart
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '⚠️ Algo salió mal. Escribí *HOLA* para empezar de nuevo.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '⚠️ Algo salió mal. Escribí *HOLA* para empezar de nuevo.');
   }
 
   const { payment_options, grand_total } = contextItem;
@@ -611,14 +749,14 @@ async function handleCustomerPaymentMethod(phone, text, state, business) {
 
   const selected = payment_options.find((o) => o.num === num);
   if (!selected) {
-    return sendMessage(phone, `⚠️ Elegí una opción del 1 al ${payment_options.length}.\nEscribí *CANCELAR* para cancelar el pedido.`);
+    return sendMessage(pc, phone, `⚠️ Elegí una opción del 1 al ${payment_options.length}.\nEscribí *CANCELAR* para cancelar el pedido.`);
   }
 
   // If transfer or deposit → show bank details
   if (selected.method === 'transfer' || selected.method === 'deposit') {
     const bank = await db.getBankDetails(business.id);
     if (!bank) {
-      return sendMessage(phone, '⚠️ No hay datos bancarios configurados. Contactá al local.');
+      return sendMessage(pc, phone, '⚠️ No hay datos bancarios configurados. Contactá al local.');
     }
 
     let amountText;
@@ -636,17 +774,20 @@ async function handleCustomerPaymentMethod(phone, text, state, business) {
     const updatedCart = cart.map((item) =>
       item._order_context ? { ...item, selected_payment: selected.method } : item
     );
-    await db.updateCustomerCart(phone, updatedCart);
-    await db.updateCustomerStep(phone, CUSTOMER_STEPS.AWAITING_TRANSFER);
+    await db.updateCustomerCart(phone, updatedCart, business.id);
+    await db.updateCustomerStep(phone, CUSTOMER_STEPS.AWAITING_TRANSFER, business.id);
 
-    return sendMessage(phone,
+    return sendButtons(pc, phone,
       '🏦 *Datos para transferir:*\n' +
       `• Alias: ${bank.alias}\n` +
       `• CBU: ${bank.cbu}\n` +
       `• Titular: ${bank.account_holder}\n\n` +
       amountText + '\n\n' +
-      'Cuando hayas transferido, respondé *LISTO*.\n' +
-      'Para cancelar, escribí *CANCELAR*.'
+      'Cuando hayas transferido, tocá *Ya transferí*.',
+      [
+        { id: 'LISTO', title: 'Ya transferí' },
+        { id: 'CANCELAR', title: 'Cancelar pedido' },
+      ]
     );
   }
 
@@ -654,32 +795,35 @@ async function handleCustomerPaymentMethod(phone, text, state, business) {
   const updatedCart = cart.map((item) =>
     item._order_context ? { ...item, selected_payment: 'cash' } : item
   );
-  await db.updateCustomerCart(phone, updatedCart);
-  return confirmAndSaveOrder(phone, state, business);
+  await db.updateCustomerCart(phone, updatedCart, business.id);
+  return confirmAndSaveOrder(pc, phone, state, business);
 }
 
 // ══════════════════════════════════════
 // STEP 8: AWAITING TRANSFER
 // ══════════════════════════════════════
 
-async function handleAwaitingTransfer(phone, text, state, business) {
+async function handleAwaitingTransfer(pc, phone, text, state, business) {
   const normalized = text.trim().toUpperCase();
 
   if (normalized === 'LISTO') {
-    return confirmAndSaveOrder(phone, state, business);
+    return confirmAndSaveOrder(pc, phone, state, business);
   }
 
   if (normalized === 'CANCELAR') {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone,
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone,
       '❌ Pedido cancelado.\n\n' +
       'Si querés hacer un nuevo pedido, escribí *MENÚ* o decinos qué querés pedir.'
     );
   }
 
-  return sendMessage(phone,
-    'Cuando hayas transferido, respondé *LISTO*.\n' +
-    'Para cancelar el pedido, escribí *CANCELAR*.'
+  return sendButtons(pc, phone,
+    'Cuando hayas transferido, tocá *Ya transferí*.',
+    [
+      { id: 'LISTO', title: 'Ya transferí' },
+      { id: 'CANCELAR', title: 'Cancelar pedido' },
+    ]
   );
 }
 
@@ -687,13 +831,13 @@ async function handleAwaitingTransfer(phone, text, state, business) {
 // ORDER CONFIRMATION + SAVE
 // ══════════════════════════════════════
 
-async function confirmAndSaveOrder(phone, state, business) {
+async function confirmAndSaveOrder(pc, phone, state, business) {
   const cart = state.cart || [];
   const contextItem = cart.find((item) => item._order_context);
 
   if (!contextItem) {
-    await db.deleteCustomerState(phone);
-    return sendMessage(phone, '⚠️ Algo salió mal. Escribí *HOLA* para empezar de nuevo.');
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '⚠️ Algo salió mal. Escribí *HOLA* para empezar de nuevo.');
   }
 
   const realItems = cart.filter((item) => !item._order_context);
@@ -727,7 +871,7 @@ async function confirmAndSaveOrder(phone, state, business) {
   });
 
   // Clean up customer state
-  await db.updateCustomerStep(phone, CUSTOMER_STEPS.ORDER_CONFIRMED);
+  await db.updateCustomerStep(phone, CUSTOMER_STEPS.ORDER_CONFIRMED, business.id);
 
   // Build confirmation message
   const paymentLabels = {
@@ -756,19 +900,21 @@ async function confirmAndSaveOrder(phone, state, business) {
   lines.push(`Podés consultar el estado escribiendo *ESTADO #${order.order_number}*.`);
   lines.push(`Para cancelar (antes de que el local confirme), escribí *CANCELAR #${order.order_number}*.`);
 
-  await sendMessage(phone, lines.join('\n'));
+  await sendMessage(pc, phone, lines.join('\n'));
 
   // Notify admin
-  await notifyAdminNewOrder(order, realItems, contextItem, business, phone, paymentMethod, depositAmount);
+  await notifyAdminNewOrder(pc, order, realItems, contextItem, business, phone, paymentMethod, depositAmount);
 
   return;
 }
 
-async function notifyAdminNewOrder(order, items, context, business, clientPhone, paymentMethod, depositAmount) {
+async function notifyAdminNewOrder(pc, order, items, context, business, clientPhone, paymentMethod, depositAmount) {
   const adminPhone = business.admin_phone;
 
+  const now = new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   const lines = [`🔔 *Nuevo pedido #${order.order_number}*\n`];
   lines.push(`📱 Cliente: ${clientPhone}`);
+  lines.push(`🕐 ${now}`);
 
   for (const item of items) {
     lines.push(`🛒 ${item.qty}x ${item.name} — $${formatPrice(item.price * item.qty)}`);
@@ -799,7 +945,7 @@ async function notifyAdminNewOrder(order, items, context, business, clientPhone,
   lines.push(`Respondé *RECHAZAR PEDIDO #${order.order_number}* para cancelar.`);
 
   try {
-    await sendMessage(adminPhone, lines.join('\n'));
+    await sendMessage(pc, adminPhone, lines.join('\n'));
     console.log(`📩 Admin notified about order #${order.order_number}`);
   } catch (error) {
     console.error(`❌ Failed to notify admin about order #${order.order_number}:`, error.message);
@@ -810,28 +956,31 @@ async function notifyAdminNewOrder(order, items, context, business, clientPhone,
 // CUSTOMER COMMANDS (ESTADO / CANCELAR)
 // ══════════════════════════════════════
 
-async function handleCustomerStatusCheck(phone, orderNumber, business) {
+async function handleCustomerStatusCheck(pc, phone, orderNumber, business) {
   const order = await db.getOrderByClientAndNumber(phone, orderNumber, business.id);
   if (!order) {
-    return sendMessage(phone, `⚠️ No encontré el pedido #${orderNumber}.`);
+    return sendMessage(pc, phone, `⚠️ No encontré el pedido #${orderNumber}.`);
   }
 
-  const statusLabels = {
-    nuevo: 'Nuevo 🆕',
-    preparando: 'Preparando 🍳',
-    en_camino: 'En camino 🛵',
-    entregado: 'Entregado ✅',
-    cancelado: 'Cancelado ❌',
-  };
+  const isConfirmed = order.payment_status === 'confirmed';
+  const isCancelled = order.order_status === 'cancelado';
 
-  const label = statusLabels[order.order_status] || order.order_status;
-  return sendMessage(phone, `📦 Pedido #${orderNumber} — Estado: *${label}*`);
+  let label;
+  if (isCancelled) {
+    label = 'Cancelado ❌';
+  } else if (isConfirmed) {
+    label = 'Confirmado ✅';
+  } else {
+    label = 'Pendiente ⏳';
+  }
+
+  return sendMessage(pc, phone, `Pedido #${orderNumber} — Estado: *${label}*`);
 }
 
-async function handleCustomerCancelOrder(phone, orderNumber, business) {
+async function handleCustomerCancelOrder(pc, phone, orderNumber, business) {
   const order = await db.getOrderByClientAndNumber(phone, orderNumber, business.id);
   if (!order) {
-    return sendMessage(phone, `⚠️ No encontré el pedido #${orderNumber}.`);
+    return sendMessage(pc, phone, `⚠️ No encontré el pedido #${orderNumber}.`);
   }
 
   if (order.order_status !== 'nuevo') {
@@ -842,18 +991,18 @@ async function handleCustomerCancelOrder(phone, orderNumber, business) {
       cancelado: 'cancelado',
     };
     const label = statusLabels[order.order_status] || order.order_status;
-    return sendMessage(phone,
+    return sendMessage(pc, phone,
       `⚠️ El pedido #${orderNumber} ya está *${label}* y no se puede cancelar.\n` +
       'Si necesitás ayuda, contactá al local.'
     );
   }
 
   await db.updateOrderStatus(order.id, 'cancelado');
-  await sendMessage(phone, `❌ Pedido #${orderNumber} cancelado.`);
+  await sendMessage(pc, phone, `❌ Pedido #${orderNumber} cancelado.`);
 
   // Notify admin
   try {
-    await sendMessage(business.admin_phone,
+    await sendMessage(pc, business.admin_phone,
       `⚠️ El cliente ${phone} canceló el pedido #${orderNumber}.`
     );
   } catch (error) {
