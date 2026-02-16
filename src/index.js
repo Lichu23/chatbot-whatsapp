@@ -2,6 +2,7 @@ const express = require('express');
 const { config } = require('./config');
 const webhookRouter = require('./routes/webhook');
 const db = require('./services/database');
+const scheduler = require('./services/scheduler');
 
 const app = express();
 
@@ -30,4 +31,7 @@ app.listen(config.port, () => {
   setInterval(() => {
     db.cleanupWebhookLogs().catch((err) => console.error('Webhook log cleanup failed:', err.message));
   }, 24 * 60 * 60 * 1000);
+
+  // Start daily summary scheduler
+  scheduler.start();
 });

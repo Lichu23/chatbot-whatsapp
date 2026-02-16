@@ -226,6 +226,189 @@ The full flow runs in your server (DB routing, business creation, onboarding sta
 
 ---
 
+## Testing Subscription Plans
+
+Every business gets an **Intermedio trial (30 days)** automatically when onboarding completes. To test different plans and feature gating, use the SQL commands below.
+
+### Plan Feature Matrix
+
+| Feature | Basico ($10) | Intermedio ($20) | Pro ($60) |
+| --- | --- | --- | --- |
+| Monthly orders | 100 | 500 | Unlimited |
+| Delivery zones | 3 | 10 | Unlimited |
+| AI (natural language) | -- | Yes | Yes |
+| Daily summary | -- | Yes | Yes |
+| Promo codes | -- | Yes | Yes |
+| Analytics queries/mo | 0 | 20 | Unlimited |
+| Broadcasts | -- | -- | Yes |
+| Loyalty program | -- | -- | Yes |
+| Scheduled messages | -- | -- | Yes |
+| Trend graphs | -- | -- | Yes |
+
+### Step 1 — Find your business ID
+
+```sql
+SELECT id, business_name FROM businesses WHERE is_active = true;
+```
+
+### Step 2 — Check current subscription
+
+```sql
+SELECT bs.id, bs.status, bs.start_date, bs.end_date, sp.slug, sp.name
+FROM business_subscriptions bs
+JOIN subscription_plans sp ON sp.id = bs.plan_id
+WHERE bs.business_id = 'YOUR_BUSINESS_ID'
+ORDER BY bs.created_at DESC
+LIMIT 1;
+```
+
+### Step 3 — Switch to a different plan
+
+To test a specific plan, cancel the current subscription and create a new one:
+
+```sql
+-- Cancel existing subscription
+UPDATE business_subscriptions
+SET status = 'cancelled', updated_at = now()
+WHERE business_id = 'YOUR_BUSINESS_ID' AND status != 'cancelled';
+
+-- Activate Basico (to test feature restrictions)
+INSERT INTO business_subscriptions (id, business_id, plan_id, status, start_date, end_date)
+VALUES (
+  gen_random_uuid(),
+  'YOUR_BUSINESS_ID',
+  (SELECT id FROM subscription_plans WHERE slug = 'basico'),
+  'active',
+  now(),
+  now() + interval '30 days'
+);
+```
+
+Replace `'basico'` with `'intermedio'` or `'pro'` to test other plans.
+
+### Step 4 — Test each plan
+
+#### Testing Basico
+
+After switching to Basico, verify these are **blocked**:
+
+| Send this (as admin) | Expected response |
+| --- | --- |
+| A natural-language message (AI intent) | Should NOT use AI classification |
+| `CREAR PROMO VERANO 10%` | "Tu plan no incluye esta funcionalidad" |
+| `ANALYTICS` | Blocked (0 analytics queries) |
+| `TENDENCIAS` | Blocked (Pro only) |
+| `DIFUSION Hola a todos` | Blocked (Pro only) |
+| `CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis` | Blocked (Pro only) |
+| `PROGRAMAR MENSAJE 20/03 18:00 Hola` | Blocked (Pro only) |
+
+And these **work**:
+
+| Send this | Expected |
+| --- | --- |
+| `PLAN` | Shows "Básico" plan info |
+| `PLANES` | Shows all 3 plans comparison |
+| `RENOVAR` | Shows renewal/upgrade options |
+| Customer places an order | Works (up to 100/month) |
+
+#### Testing Intermedio
+
+After switching to Intermedio, verify:
+
+| Send this | Expected |
+| --- | --- |
+| `CREAR PROMO VERANO 10%` | Creates promo (promo_codes enabled) |
+| `VER PROMOS` | Lists promos |
+| `ANALYTICS` | Shows analytics report (up to 20/month) |
+| `TENDENCIAS` | Blocked (Pro only) |
+| `DIFUSION Hola` | Blocked (Pro only) |
+| `CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis` | Blocked (Pro only) |
+| AI intent (e.g. "cuantos pedidos tengo hoy") | AI classifies the intent |
+
+#### Testing Pro
+
+After switching to Pro, **everything** should work:
+
+| Send this | Expected |
+| --- | --- |
+| `ANALYTICS` | Full report, unlimited queries |
+| `TENDENCIAS` | 8-week trend graphs |
+| `DIFUSION Promo 2x1 hoy!` | Sends to all customers |
+| `CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis` | Configures loyalty |
+| `VER FIDELIDAD` | Shows loyalty config |
+| `PROGRAMAR MENSAJE 20/03 18:00 Hola` | Schedules message |
+| `VER PROGRAMADOS` | Lists scheduled messages |
+| `CREAR PROMO VERANO 10%` | Creates promo |
+
+### Step 5 — Test order limits
+
+To test that order limits are enforced, artificially set the monthly count close to the limit:
+
+```sql
+-- Set Basico business to 99 orders this month (limit is 100)
+INSERT INTO monthly_order_counts (id, business_id, month, order_count)
+VALUES (gen_random_uuid(), 'YOUR_BUSINESS_ID', to_char(now(), 'YYYY-MM'), 99)
+ON CONFLICT (business_id, month) DO UPDATE SET order_count = 99;
+```
+
+Now place one order (should work), then a second (should be blocked with "order limit reached").
+
+### Step 6 — Test subscription expiry
+
+Force-expire a subscription to test the expiry flow:
+
+```sql
+UPDATE business_subscriptions
+SET end_date = now() - interval '1 day', updated_at = now()
+WHERE business_id = 'YOUR_BUSINESS_ID' AND status IN ('trial', 'active');
+```
+
+Next time the admin or a customer sends a message, `getActiveSubscription` will detect the expiry, update status to `expired`, and:
+- Admin sees: "Tu suscripcion ha expirado" with renewal instructions
+- Customer ordering: blocked until renewed
+
+### Step 7 — Test super-admin payment confirmation
+
+From the **super-admin phone** (configured in `.env` as `SUPER_ADMIN_PHONE`):
+
+```
+CONFIRMAR PAGO +5491155551234 pro
+```
+
+This activates a Pro subscription for 1 month for the business whose admin phone is `+5491155551234`.
+
+### Automated tests
+
+```bash
+# Unit tests (no DB required) — 100 tests
+node test/test-subscriptions.js
+
+# Integration tests (requires Supabase + migrations)
+node test/verify-subscriptions.js
+```
+
+### Reset subscription data
+
+```sql
+-- Reset subscription to fresh trial
+DELETE FROM business_subscriptions WHERE business_id = 'YOUR_BUSINESS_ID';
+DELETE FROM monthly_order_counts WHERE business_id = 'YOUR_BUSINESS_ID';
+DELETE FROM analytics_usage WHERE business_id = 'YOUR_BUSINESS_ID';
+
+-- Re-create trial (Intermedio, 30 days)
+INSERT INTO business_subscriptions (id, business_id, plan_id, status, start_date, end_date)
+VALUES (
+  gen_random_uuid(),
+  'YOUR_BUSINESS_ID',
+  (SELECT id FROM subscription_plans WHERE slug = 'intermedio'),
+  'trial',
+  now(),
+  now() + interval '30 days'
+);
+```
+
+---
+
 ## Resetting Test Data
 
 ### Reset everything for a phone number

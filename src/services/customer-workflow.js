@@ -1,4 +1,7 @@
 const db = require('./database');
+const subscription = require('./subscription');
+const promos = require('./promos');
+const loyalty = require('./loyalty');
 const { sendMessage, sendButtons, sendList, sendCatalogList } = require('./whatsapp');
 const { extractOrderItems } = require('./ai');
 const { config, CUSTOMER_STEPS } = require('../config');
@@ -644,7 +647,15 @@ async function showOrderSummaryAndPayment(pc, phone, state, business, method, ad
     }
   }
 
-  const grandTotal = subtotal + deliveryPrice;
+  let grandTotal = subtotal + deliveryPrice;
+
+  // Check for pending loyalty reward
+  let loyaltyDiscount = 0;
+  const pendingReward = await loyalty.checkPendingReward(business.id, phone);
+  if (pendingReward) {
+    loyaltyDiscount = await loyalty.applyReward(business.id, phone, subtotal);
+    grandTotal = Math.max(0, grandTotal - loyaltyDiscount);
+  }
 
   // Build summary
   const lines = ['📋 *Resumen de tu pedido:*\n'];
@@ -662,6 +673,10 @@ async function showOrderSummaryAndPayment(pc, phone, state, business, method, ad
     if (business.business_address) {
       lines.push(`🏪 Retiro en: ${business.business_address}`);
     }
+  }
+
+  if (loyaltyDiscount > 0) {
+    lines.push(`🏆 Recompensa fidelidad: -$${formatPrice(loyaltyDiscount)}`);
   }
 
   lines.push(`💰 *Total: $${formatPrice(grandTotal)}*`);
@@ -696,11 +711,18 @@ async function showOrderSummaryAndPayment(pc, phone, state, business, method, ad
     address: address || null,
     delivery_method: method,
     payment_options: paymentOptions,
+    loyalty_discount: loyaltyDiscount || 0,
   };
 
   // Store context in cart (append as last item with special flag)
   const cartWithContext = [...cart, { _order_context: true, ...orderContext }];
   await db.updateCustomerCart(phone, cartWithContext, business.id);
+
+  // Check if business has promo codes enabled
+  const hasPromos = await subscription.checkFeatureAccess(business.id, 'promo_codes');
+  if (hasPromos) {
+    lines.push('\n🎟️ ¿Tenés un código de descuento? Escribilo antes de elegir el pago.');
+  }
 
   lines.push('\n💳 *¿Cómo querés pagar?*');
 
@@ -749,6 +771,44 @@ async function handleCustomerPaymentMethod(pc, phone, text, state, business) {
 
   const selected = payment_options.find((o) => o.num === num);
   if (!selected) {
+    // Not a payment number — try as promo code if business supports it
+    const hasPromos = await subscription.checkFeatureAccess(business.id, 'promo_codes');
+    if (hasPromos && text.trim().length >= 2 && isNaN(num)) {
+      const result = await promos.validatePromo(business.id, text.trim());
+      if (result.valid) {
+        const discount = promos.calculateDiscount(result.promo, contextItem.subtotal);
+        const newGrandTotal = Math.max(0, grand_total - discount);
+        await promos.applyPromo(result.promo.id);
+
+        // Update context with promo info
+        const updatedCart = cart.map((item) => {
+          if (!item._order_context) return item;
+          return {
+            ...item,
+            promo_id: result.promo.id,
+            promo_code: result.promo.code,
+            discount,
+            grand_total: newGrandTotal,
+          };
+        });
+        await db.updateCustomerCart(phone, updatedCart, business.id);
+
+        const discountLabel = result.promo.discount_type === 'percent'
+          ? `${result.promo.discount_value}%`
+          : `$${result.promo.discount_value}`;
+
+        return sendMessage(pc, phone,
+          `🎟️ *¡Código ${result.promo.code} aplicado!*\n\n` +
+          `Descuento: ${discountLabel} (-$${formatPrice(discount)})\n` +
+          `💰 *Nuevo total: $${formatPrice(newGrandTotal)}*\n\n` +
+          `💳 Ahora elegí cómo pagar (1-${payment_options.length}).`
+        );
+      } else {
+        return sendMessage(pc, phone,
+          `⚠️ ${result.error}\n\nElegí una opción del 1 al ${payment_options.length} para pagar.\nEscribí *CANCELAR* para cancelar el pedido.`
+        );
+      }
+    }
     return sendMessage(pc, phone, `⚠️ Elegí una opción del 1 al ${payment_options.length}.\nEscribí *CANCELAR* para cancelar el pedido.`);
   }
 
@@ -844,6 +904,25 @@ async function confirmAndSaveOrder(pc, phone, state, business) {
   const paymentMethod = contextItem.selected_payment || 'cash';
   const grandTotal = contextItem.grand_total;
 
+  // Check monthly order limit before creating order
+  const orderLimit = await subscription.checkOrderLimit(business.id);
+  if (!orderLimit.allowed) {
+    await sendMessage(pc, phone,
+      '⚠️ Este negocio alcanzó su límite mensual de pedidos. ' +
+      'Por favor intentá de nuevo el próximo mes o contactá al negocio directamente.'
+    );
+    // Notify admin about the limit
+    if (business.admin_phone) {
+      await sendMessage(pc, business.admin_phone,
+        `⚠️ *Límite de pedidos alcanzado*\n\n` +
+        `Un cliente intentó hacer un pedido pero ya alcanzaste el límite de tu plan ` +
+        `(${orderLimit.current}/${orderLimit.limit} pedidos este mes).\n\n` +
+        `Enviá *PLANES* para ver opciones de upgrade.`
+      );
+    }
+    return;
+  }
+
   let depositAmount = null;
   if (paymentMethod === 'deposit' && business.deposit_percent) {
     depositAmount = Math.ceil(grandTotal * business.deposit_percent / 100);
@@ -870,6 +949,13 @@ async function confirmAndSaveOrder(pc, phone, state, business) {
     deposit_amount: depositAmount,
   });
 
+  // Increment monthly order count
+  const month = new Date().toISOString().slice(0, 7);
+  await db.incrementMonthlyOrderCount(business.id, month);
+
+  // Increment loyalty card
+  const loyaltyResult = await loyalty.incrementLoyalty(business.id, phone);
+
   // Clean up customer state
   await db.updateCustomerStep(phone, CUSTOMER_STEPS.ORDER_CONFIRMED, business.id);
 
@@ -892,6 +978,23 @@ async function confirmAndSaveOrder(pc, phone, state, business) {
     lines.push(`🚚 Delivery a: ${contextItem.address}${contextItem.zone_name ? `, ${contextItem.zone_name}` : ''}`);
   } else if (contextItem.delivery_method === 'pickup' && business.business_address) {
     lines.push(`🏪 Retiro en: ${business.business_address}`);
+  }
+
+  if (contextItem.loyalty_discount > 0) {
+    lines.push(`🏆 Recompensa fidelidad: -$${formatPrice(contextItem.loyalty_discount)}`);
+  }
+
+  // Loyalty progress notification
+  if (loyaltyResult) {
+    const cfg = loyaltyResult.config;
+    const progress = loyaltyResult.card.order_count % cfg.threshold;
+    const remaining = cfg.threshold - progress;
+    if (loyaltyResult.rewardEarned) {
+      lines.push(`\n🎉 *¡Ganaste una recompensa!* (${loyalty.formatRewardLabel(cfg)})`);
+      lines.push('Se aplica automáticamente en tu próximo pedido.');
+    } else if (remaining <= 3) {
+      lines.push(`\n🏆 ¡Te faltan *${remaining}* pedido${remaining > 1 ? 's' : ''} para tu próxima recompensa!`);
+    }
   }
 
   lines.push('\n⏳ *Tu pedido está pendiente de confirmación por el local.*');
@@ -927,6 +1030,9 @@ async function notifyAdminNewOrder(pc, order, items, context, business, clientPh
     lines.push('🏪 Retiro en local');
   }
 
+  if (context.promo_code) {
+    lines.push(`🎟️ Promo: ${context.promo_code} (-$${formatPrice(context.discount)})`);
+  }
   lines.push(`💰 Total: $${formatPrice(context.grand_total)}`);
 
   const paymentLabels = {

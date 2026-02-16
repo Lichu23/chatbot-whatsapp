@@ -112,15 +112,34 @@ INTENCIONES DISPONIBLES:
 - "pause_product" — quiere pausar o reactivar un producto
 - "sync_catalog" — quiere sincronizar/actualizar productos del catálogo
 - "help" — quiere saber qué puede hacer o cómo funciona algo
+- "analytics" — quiere estadísticas avanzadas: productos más vendidos, clientes recurrentes, horas pico, días populares
+- "trends" — quiere ver tendencias, proyecciones, predicciones de ganancias futuras, comparar meses, evolución del negocio
+- "create_promo" — quiere crear una promoción, código de descuento, oferta especial (ej: "crear promo", "quiero hacer una promo", "descuento")
+- "view_promos" — quiere ver las promos activas
+- "broadcast" — quiere enviar un mensaje masivo / difusión a todos los clientes (ej: "difusion", "enviar mensaje a todos", "mensaje masivo")
+- "configure_loyalty" — quiere configurar o crear un programa de fidelización, recompensar clientes recurrentes, dar descuentos por fidelidad (ej: "fidelidad", "fidelizacion", "recompensar clientes")
+- "view_loyalty" — quiere ver el programa de fidelización actual
+- "edit_product" — quiere editar/modificar/cambiar el precio, nombre o descripción de un producto existente
+- "add_product" — quiere agregar un producto nuevo al menú/catálogo
+- "view_plan" — quiere ver su plan actual
+- "view_plans" — quiere comparar los planes disponibles
+- "change_plan" — quiere cambiar de plan (args: planSlug = "basico", "intermedio" o "pro" si lo menciona, o null si no especifica)
 - "general_question" — tiene una pregunta general sobre la plataforma, su negocio, o necesita ayuda con algo que no es un comando directo
 - "greeting" — es un saludo simple (hola, buenos días, etc.)
 
 REGLAS:
 - Si el mensaje es ambiguo, preferí "general_question"
-- Si mencionan algo sobre productos/precios/agregar/eliminar/editar un producto específico → "general_question" (no pueden hacerlo desde el chat)
+- Si mencionan agregar un producto nuevo → "add_product"
+- Si mencionan editar/cambiar precio/nombre/descripción de un producto existente → "edit_product"
+- Si mencionan eliminar un producto → "general_question" (no pueden hacerlo desde el chat)
+- Si mencionan "promo", "descuento", "oferta", "código" → "create_promo" (aunque no den los detalles completos)
+- Si mencionan "fidelidad", "fidelización", "recompensar", "premiar clientes" → "configure_loyalty"
+- Si mencionan "difusión", "difundir", "mensaje masivo", "enviar a todos" → "broadcast"
+- Si mencionan "tendencias", "predicción", "proyección", "cuánto voy a ganar", "mes que viene" → "trends"
 - Respondé SOLO con JSON válido:
 {"intent": "edit_hours", "args": {}}
 {"intent": "sales_summary", "args": {"period": "hoy"}}
+{"intent": "change_plan", "args": {"planSlug": "pro"}}
 {"intent": "general_question", "args": {}}`;
 
   try {
@@ -148,6 +167,13 @@ LO QUE EL ADMIN PUEDE HACER DESDE ESTE CHAT:
 - Sincronizar productos del catálogo (si se agregaron productos en el catálogo de WhatsApp)
 - Ver su menú, pedidos pendientes, resumen del negocio, ventas del día/semana/mes
 
+FUNCIONES AVANZADAS DISPONIBLES (el admin debe usar los comandos exactos):
+- *CREAR PROMO código 10%* — crear código de descuento (plan Intermedio/Pro)
+- *DIFUSION mensaje* — enviar mensaje masivo a clientes (plan Pro)
+- *CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis* — programa de fidelización (plan Pro)
+- *TENDENCIAS* — ver tendencias y proyecciones (plan Pro)
+- *ANALYTICS* — estadísticas avanzadas (plan Intermedio/Pro)
+
 LO QUE EL ADMIN NO PUEDE HACER DESDE ESTE CHAT (debe contactar al administrador de la plataforma):
 - Agregar, eliminar o editar productos (nombre, precio, descripción, foto) — esto se gestiona desde el catálogo de WhatsApp en Meta Commerce Manager
 - Cambiar el número de WhatsApp del negocio
@@ -155,6 +181,7 @@ LO QUE EL ADMIN NO PUEDE HACER DESDE ESTE CHAT (debe contactar al administrador 
 
 REGLAS:
 - Respondé de forma directa y útil, máximo 3-4 líneas
+- Si preguntan sobre promos, fidelidad, difusiones, tendencias o analytics, indicá el comando exacto que deben usar (ej: "Escribí *CREAR PROMO VERANO 10%* para crear una promo")
 - Si preguntan algo que no pueden hacer desde el chat, explicá amablemente y sugerí contactar al administrador de la plataforma
 - No uses markdown complejo, solo *negritas* y saltos de línea
 - Respondé SOLO con JSON: {"answer": "tu respuesta aquí"}`;

@@ -78,6 +78,9 @@ const STEPS = {
   DELETE_PRODUCT: 'delete_product',
   PAUSE_PRODUCT: 'pause_product',
   PAUSE_PRODUCT_ACTION: 'pause_product_action',
+  EDIT_PRODUCT_SELECT: 'edit_product_select',
+  EDIT_PRODUCT_FIELD: 'edit_product_field',
+  EDIT_PRODUCT_VALUE: 'edit_product_value',
   LINK_CATALOG: 'link_catalog',
 };
 
@@ -93,6 +96,19 @@ const CUSTOMER_STEPS = {
   PAYMENT_METHOD: 'c_payment_method',
   AWAITING_TRANSFER: 'c_awaiting_transfer',
   ORDER_CONFIRMED: 'c_order_confirmed',
+};
+
+const PLAN_SLUGS = {
+  BASICO: 'basico',
+  INTERMEDIO: 'intermedio',
+  PRO: 'pro',
+};
+
+const SUBSCRIPTION_STATUS = {
+  TRIAL: 'trial',
+  ACTIVE: 'active',
+  EXPIRED: 'expired',
+  CANCELLED: 'cancelled',
 };
 
 const PAYMENT_OPTIONS = {
@@ -114,4 +130,4 @@ function getPaymentLabel(business) {
   return 'No configurado';
 }
 
-module.exports = { config, INVITE_CODE_REGEX, STEPS, CUSTOMER_STEPS, PAYMENT_OPTIONS, getPaymentLabel };
+module.exports = { config, INVITE_CODE_REGEX, STEPS, CUSTOMER_STEPS, PLAN_SLUGS, SUBSCRIPTION_STATUS, PAYMENT_OPTIONS, getPaymentLabel };

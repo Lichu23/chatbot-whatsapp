@@ -150,9 +150,8 @@
 - [x] 92. Handle `location` message type in `extract-message.js` (lat/lng/address)
 - [x] 93. Customer delivery address step uses location request with text fallback
 
-## Phase 17 — Future Improvements
+## Phase 17 — Remaining Improvements
 - [ ] 94. Automatic admin re-alerts for unconfirmed orders
-- [ ] 95. Customer order history ("MIS PEDIDOS")
 - [ ] 96. Proof of payment image attachment
 
 ---
@@ -243,12 +242,117 @@
 - [x] 138. Test: catalog products show correctly per business (different menus, different prices)
 - [x] 139. Test: webhook signature validation rejects invalid requests
 
-## Phase 26 — Future Production Improvements
-- [ ] 140. Admin dashboard (web panel) for you to manage all businesses, numbers, and billing
-- [ ] 141. Auto-billing: track conversation counts per business, generate monthly invoices
-- [ ] 142. Subscription management: auto-disable businesses that don't pay after trial
-- [ ] 143. Business analytics: order volume, popular products, peak hours (per business)
-- [ ] 144. Multi-language support (configurable per business)
-- [ ] 145. Automatic admin re-alerts for unconfirmed orders
-- [ ] 146. Customer order history ("MIS PEDIDOS")
-- [ ] 147. Proof of payment image attachment
+---
+
+# Subscription & Monetization System
+
+## Phase 26 — Subscription System (Database + Service) ✅
+- [x] 140. Create `subscription_plans` table (basico/intermedio/pro with limits and features)
+- [x] 141. Create `business_subscriptions` table (status: trial/active/expired/cancelled, dates)
+- [x] 142. Create `monthly_order_counts` table (tracks orders per business per month)
+- [x] 143. Seed 3 plans: Basico ($10, 100 orders, 3 zones), Intermedio ($20, 500 orders, 10 zones), Pro ($60, unlimited)
+- [x] 144. Create `src/services/subscription.js` — trial creation, limit checks, feature access, payment confirmation
+- [x] 145. Add subscription CRUD functions to `src/services/database.js`
+- [x] 146. Add plan constants and feature flags to `src/config/index.js`
+
+## Phase 27 — Feature Gating (AI vs Commands) ✅
+- [x] 147. Modify `src/services/workflow.js`: route admin messages through AI (Intermedio/Pro) vs commands-only (Basico)
+- [x] 148. Basic admins: free-form text → "Comando no reconocido. Enviá AYUDA." Commands still work.
+- [x] 149. Add `AGREGAR PRODUCTO nombre | precio | categoria` strict format for Basic (no AI parsing)
+- [x] 150. Add `AYUDA` command: list all available commands for Basic users
+- [x] 151. Auto-create 30-day Intermedio trial when business completes onboarding (REVIEW step)
+- [x] 152. Send trial welcome message with plan details and expiry date
+
+## Phase 28 — Order & Zone Limits ✅
+- [x] 153. ✅ Before order creation in `customer-workflow.js` → check monthly order limit
+- [x] 154. ✅ If limit reached → tell customer "Este negocio alcanzó su límite mensual", notify admin with upgrade prompt
+- [x] 155. ✅ Increment monthly order count on successful order creation
+- [x] 156. ✅ Before adding delivery zones → check zone limit per plan
+- [x] 157. ✅ If zone limit reached → tell admin "Tu plan permite hasta {max} zonas. Enviá PLANES para ver opciones."
+
+## Phase 29 — Subscription Expiry & Renewal
+- [x] 158. Customer flow start: if subscription expired → "Este negocio no está disponible en este momento" ✅
+- [x] 159. Notify admin on expiry: "Tu suscripción expiró. Enviá PLAN para ver tu estado o RENOVAR para pagar." ✅
+- [x] 160. Add `PLAN` command: shows current plan, status, usage (orders this month), expiry date ✅
+- [x] 161. Add `PLANES` command: shows 3 plans with features and prices ✅
+- [x] 162. Add `RENOVAR` command: shows bank details + payment instructions + plan selection ✅
+- [x] 163. Add `CAMBIAR PLAN basico/intermedio/pro` command: request plan change ✅
+
+## Phase 30 — Super-Admin Subscription Management
+- [x] 164. `CONFIRMAR PAGO +5493XXX intermedio` — activate subscription for 30 days (from ALERT_PHONE only) ✅
+- [x] 165. `VER SUSCRIPCIONES` — list all businesses with plan, status, expiry ✅
+- [x] 166. `EXPIRADAS` — list expired and expiring-soon businesses ✅
+- [x] 167. Validate super-admin commands only work from ALERT_PHONE ✅
+
+## Phase 31 — Promo Codes (Intermediate + Pro)
+- [x] 168. Create `promo_codes` table (code, discount_type, discount_value, business_id, max_uses, expires_at) ✅
+- [x] 169. Create `src/services/promos.js` — CRUD + validation ✅
+- [x] 170. Admin command `CREAR PROMO código 10%` — create discount code ✅
+- [x] 171. Admin command `VER PROMOS` — list active promo codes ✅
+- [x] 172. Customer can type promo code during checkout → apply discount to order total ✅
+- [x] 173. Gate: only Intermediate and Pro plans can create/use promo codes ✅
+
+## Phase 32 — Daily Auto-Summary (Intermediate + Pro)
+- [x] 174. Create `src/services/scheduler.js` — cron-like scheduler using setInterval ✅
+- [x] 175. At business closing time (from business_hours) → send daily summary to admin ✅
+- [x] 176. Summary includes: total orders, revenue, top 3 products, pending orders ✅
+- [x] 177. Gate: only Intermediate and Pro plans receive daily summary ✅
+
+## Phase 33 — Analytics Engine (Intermediate: 20/mo, Pro: Unlimited)
+- [x] 178. Create `src/services/analytics.js` — query functions for business intelligence ✅
+- [x] 179. Queries: top products by sales, repeat customer %, total unique customers, peak ordering hours, popular days ✅
+- [x] 180. Create `analytics_usage` table to track queries per business per month ✅
+- [x] 181. Admin command `ANALYTICS` or AI query "cuáles son mis productos más vendidos?" ✅
+- [x] 182. Gate: Intermediate = 20 queries/month, Pro = unlimited ✅
+
+## Phase 34 — Trend Graphs (Pro Only)
+- [x] 183. Generate text-based trend data (weekly/monthly sales progression) ✅
+- [x] 184. Admin command `TENDENCIAS` — show revenue trend, order trend, growth % ✅
+- [x] 185. Gate: Pro plan only ✅
+
+## Phase 35 — Scheduled Messages (Pro Only)
+- [x] 186. Create `scheduled_messages` table (business_id, message, send_at, status) ✅
+- [x] 187. Admin command `PROGRAMAR MENSAJE dd/mm HH:MM texto` — schedule a message to all past customers ✅
+- [x] 188. Scheduler picks up pending messages and sends at scheduled time ✅
+- [x] 189. Gate: Pro plan only ✅
+
+## Phase 36 — WhatsApp Broadcasts (Pro Only)
+- [x] 190. Track customer phone numbers per business (from orders) ✅
+- [x] 191. Admin command `DIFUSION mensaje` — send to all past customers ✅
+- [x] 192. Respect Meta's 24h conversation window (use message templates for outside window) ✅
+- [x] 193. Gate: Pro plan only ✅
+
+## Phase 37 — Customer Loyalty & Rewards (Pro Only)
+- [x] 194. Create `loyalty_cards` table (customer_phone, business_id, points/stamps, rewards_claimed) ✅
+- [x] 195. Auto-increment loyalty on each completed order ✅
+- [x] 196. Admin configures reward: `CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis` ✅
+- [x] 197. Customer reaches threshold → auto-apply reward on next order ✅
+- [x] 198. Gate: Pro plan only ✅
+
+## Phase 38 — Testing Subscription System
+- [x] 199. Test: onboarding → trial auto-created (Intermedio, 30 days) ✅
+- [x] 200. Test: trial active → AI works, analytics works, promo codes work ✅
+- [x] 201. Test: trial expired → customer ordering blocked, admin notified ✅
+- [x] 202. Test: Basic plan → AI blocked, commands work, 100 order limit enforced ✅
+- [x] 203. Test: Intermediate → AI works, 500 orders, 20 analytics queries ✅
+- [x] 204. Test: Pro → unlimited everything, broadcasts, loyalty ✅
+- [x] 205. Test: super-admin confirms payment → subscription activates ✅
+- [x] 206. Test: `PLAN`, `PLANES`, `RENOVAR` commands return correct info ✅
+
+## Phase 39 — Order Scheduling (Instant vs Advance Orders)
+- [ ] 207. Add `order_mode` (`'instant'` | `'advance'`), `min_advance_days`, `max_advance_days` columns to `businesses` table
+- [ ] 208. Add `delivery_date` column to `orders` table
+- [ ] 209. Create SQL migration file `sql/add-order-scheduling.sql`
+- [ ] 210. Add `DELIVERY_DATE` step to `CUSTOMER_STEPS` in `src/config/index.js`
+- [ ] 211. Add `EDIT_ORDER_MODE` step to admin `STEPS` in `src/config/index.js`
+- [ ] 212. Update `db.createOrder()` in `src/services/database.js` to accept and store `delivery_date`
+- [ ] 213. New `handleCustomerDeliveryDate()` in `src/services/customer-workflow.js` — show available dates as interactive list, validate min/max range
+- [ ] 214. After delivery address step: if `order_mode='instant'` skip date step (current behavior), if `'advance'` transition to DELIVERY_DATE
+- [ ] 215. Update `showOrderSummaryAndPayment()` — display delivery date in order summary when set
+- [ ] 216. Update `confirmAndSaveOrder()` — pass `delivery_date` to `db.createOrder()` and include in admin notification
+- [ ] 217. Add admin command `PEDIDOS` in `src/services/workflow.js` — toggle between instant/advance mode, configure min/max days
+- [ ] 218. Add `handleEditOrderMode()` handler for the EDIT_ORDER_MODE step
+- [ ] 219. Update `buildReviewSummary()` to show order mode configuration
+- [ ] 220. Test: instant mode — customer flow unchanged, no date selection step
+- [ ] 221. Test: advance mode (min=3, max=30) — customer sees date picker, selects valid date, order saved with delivery_date
+- [ ] 222. Test: admin `PEDIDOS` command switches between modes correctly

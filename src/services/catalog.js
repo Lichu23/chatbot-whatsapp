@@ -174,4 +174,50 @@ async function setProductAvailability(token, catalogId, retailerId, availability
   return data;
 }
 
-module.exports = { fetchCatalogProducts, syncCatalogToDatabase, parsePrice, setProductVisibility, setProductAvailability };
+/**
+ * Update product fields (name, price, description) in the Meta catalog.
+ * @param {string} token - Meta API token
+ * @param {string} catalogId - Meta catalog ID
+ * @param {string} retailerId - Product retailer_id
+ * @param {object} fields - { name, price, description } (only include fields to update)
+ */
+async function updateProductFields(token, catalogId, retailerId, fields) {
+  const data = { id: retailerId };
+  if (fields.name) data.name = fields.name;
+  if (fields.price != null) data.price = `${Math.round(fields.price * 100)} ARS`;
+  if (fields.description != null) data.description = fields.description;
+
+  const res = await fetch(
+    `https://graph.facebook.com/${API_VERSION}/${catalogId}/items_batch`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        item_type: 'PRODUCT_ITEM',
+        requests: [
+          {
+            method: 'UPDATE',
+            retailer_id: retailerId,
+            data,
+          },
+        ],
+      }),
+    }
+  );
+
+  const result = await res.json();
+
+  if (!res.ok) {
+    const msg = result.error?.message || 'Failed to update product fields';
+    console.error('Meta Catalog API update error:', msg);
+    throw new Error(msg);
+  }
+
+  console.log(`📦 [Catalog API] Product ${retailerId} updated:`, fields);
+  return result;
+}
+
+module.exports = { fetchCatalogProducts, syncCatalogToDatabase, parsePrice, setProductVisibility, setProductAvailability, updateProductFields };

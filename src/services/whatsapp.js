@@ -369,4 +369,53 @@ async function sendLocationRequest(phoneConfig, to, body) {
   }
 }
 
-module.exports = { sendMessage, sendButtons, sendList, sendProduct, sendCatalogList, sendLocationRequest, markAsReadAndTyping };
+/**
+ * Send a template message (for outside 24h conversation window).
+ * Uses the 'hello_world' template by default, or a custom template name.
+ * Template messages can be sent at any time, unlike free-form messages.
+ */
+async function sendTemplate(phoneConfig, to, templateName = 'hello_world', languageCode = 'es', components = []) {
+  console.log(`📤 Sending template "${templateName}" to ${to}`);
+
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: languageCode },
+      },
+    };
+
+    if (components.length > 0) {
+      payload.template.components = components;
+    }
+
+    const res = await metaApiFetch(`${getBaseUrl(phoneConfig)}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${getToken(phoneConfig)}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      console.error(`📤 ❌ Template send error:`, JSON.stringify(data));
+      throw new Error(data.error?.message || 'Failed to send template');
+    }
+
+    const messageId = data.messages?.[0]?.id || 'unknown';
+    console.log(`📤 Template sent OK — ID: ${messageId}`);
+    return data;
+  } catch (error) {
+    console.error(`📤 ❌ Failed to send template to ${to}:`, error.message);
+    throw error;
+  }
+}
+
+module.exports = { sendMessage, sendButtons, sendList, sendProduct, sendCatalogList, sendLocationRequest, sendTemplate, markAsReadAndTyping };

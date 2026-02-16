@@ -1,16 +1,22 @@
 const db = require('./database');
 const ai = require('./ai');
+const subscription = require('./subscription');
 const { tryRegister } = require('./registration');
-const { sendMessage, sendButtons, sendList } = require('./whatsapp');
+const { sendMessage, sendButtons, sendList, sendTemplate } = require('./whatsapp');
 const { processCustomerMessage } = require('./customer-workflow');
-const { syncCatalogToDatabase, setProductVisibility, setProductAvailability } = require('./catalog');
+const { syncCatalogToDatabase, setProductVisibility, setProductAvailability, updateProductFields } = require('./catalog');
 const { config, STEPS, PAYMENT_OPTIONS, getPaymentLabel } = require('../config');
+const promos = require('./promos');
+const analytics = require('./analytics');
+const loyalty = require('./loyalty');
 const { parseCommand } = require('../utils/commands');
 
 const CUSTOMER_MSG = 'El negocio se está configurando, volvé pronto.';
 
 // Temporary in-memory store for pause product selection (phone → productId)
 const pauseProductSelection = new Map();
+// Temporary in-memory store for edit product selection (phone → { productId, field })
+const editProductSelection = new Map();
 
 /**
  * Main orchestration — routes every incoming message to the right handler.
@@ -59,6 +65,13 @@ async function processMessage(message) {
   }
 
   if (activeBusiness) {
+    // Check if the business subscription is still active
+    const sub = await subscription.getActiveSubscription(activeBusiness.id);
+    if (!sub) {
+      return sendMessage(phoneConfig, from,
+        '⚠️ Este negocio no está disponible en este momento. Por favor intentá más tarde.'
+      );
+    }
     console.log(`🛒 Active business found: ${activeBusiness.business_name} — routing to customer flow`);
     return processCustomerMessage(message, activeBusiness, phoneConfig);
   }
@@ -134,6 +147,12 @@ async function handleStep(pc, phone, text, state) {
       return handlePauseProduct(pc, phone, text, business_id);
     case STEPS.PAUSE_PRODUCT_ACTION:
       return handlePauseProductAction(pc, phone, text, business_id);
+    case STEPS.EDIT_PRODUCT_SELECT:
+      return handleEditProductSelect(pc, phone, text, business_id);
+    case STEPS.EDIT_PRODUCT_FIELD:
+      return handleEditProductField(pc, phone, text, business_id);
+    case STEPS.EDIT_PRODUCT_VALUE:
+      return handleEditProductValue(pc, phone, text, business_id);
     case STEPS.LINK_CATALOG:
       return handleLinkCatalog(pc, phone, text, business_id);
 
@@ -329,6 +348,18 @@ async function handleDeliveryZones(pc, phone, text, businessId) {
   if (!zones) {
     return sendMessage(pc, phone, '⚠️ Necesito el precio para cada zona. Probá así:\n"Centro $500, Almagro $600, Caballito $800"');
   }
+
+  // Check zone limit (replaceZones replaces all, so check new count vs limit)
+  const sub = await subscription.getActiveSubscription(businessId);
+  const zoneLimit = sub?.plan?.delivery_zone_limit || 3;
+  if (zones.length > zoneLimit) {
+    return sendMessage(pc, phone,
+      `⚠️ Tu plan permite hasta *${zoneLimit}* zonas de delivery. ` +
+      `Estás intentando agregar ${zones.length}.\n\n` +
+      `Enviá *PLANES* para ver opciones de upgrade.`
+    );
+  }
+
   await db.replaceZones(businessId, zones);
   await db.updateUserStep(phone, STEPS.DELIVERY_ZONES_CONFIRM);
   const zoneLines = zones.map((z) => `• ${z.zone_name} — $${z.price}`).join('\n');
@@ -474,35 +505,64 @@ async function handleReview(pc, phone, text, businessId) {
       }
     }
 
+    // Auto-create 30-day Intermedio trial
+    let trialSub = null;
+    try {
+      trialSub = await subscription.createTrialSubscription(businessId);
+      console.log(`🆓 Trial created for business ${businessId}, expires ${trialSub.end_date}`);
+    } catch (err) {
+      console.error('🆓 Failed to create trial:', err.message);
+    }
+
+    const trialEndStr = trialSub
+      ? new Date(trialSub.end_date).toLocaleDateString('es-AR')
+      : null;
+
     if (syncResult && syncResult.total > 0) {
       // Products imported — activate business
       await db.updateBusiness(businessId, { is_active: true });
       await db.updateUserStep(phone, STEPS.COMPLETED);
-      return sendMessage(pc, phone,
-        '🎉 *¡Tu negocio está activo!*\n\n' +
+
+      let msg = '🎉 *¡Tu negocio está activo!*\n\n' +
         `*${business.business_name}* ya está listo para recibir pedidos.\n\n` +
-        `📦 Se importaron ${syncResult.total} productos desde tu catálogo.\n\n` +
-        '🤖 *Soy tu asistente.* Podés preguntarme lo que necesites de forma natural:\n' +
+        `📦 Se importaron ${syncResult.total} productos desde tu catálogo.\n\n`;
+
+      if (trialSub) {
+        msg += `🆓 *Prueba gratuita activada: Plan ${trialSub.plan.name}*\n` +
+          `Tenés 30 días gratis con IA, resumen diario, promos y más.\n` +
+          `Vence: ${trialEndStr}\n\n`;
+      }
+
+      msg += '🤖 *Soy tu asistente.* Podés preguntarme lo que necesites de forma natural:\n' +
         '• "Quiero cambiar el horario"\n' +
         '• "Cuántos pedidos tengo?"\n' +
         '• "Cómo agrego un producto?"\n\n' +
         '📋 Para pausar un producto: *PAUSAR PRODUCTO*\n' +
         '📋 Para confirmar un pago: *CONFIRMAR PAGO #N*\n\n' +
-        'Escribí *AYUDA* en cualquier momento para ver más opciones.'
-      );
+        'Escribí *AYUDA* en cualquier momento para ver más opciones.';
+
+      return sendMessage(pc, phone, msg);
     }
 
     // No products synced — keep inactive, wait for manual sync
     await db.updateUserStep(phone, STEPS.COMPLETED);
-    return sendMessage(pc, phone,
-      '✅ *¡Configuración completada!*\n\n' +
-      `*${business.business_name}* quedó registrado correctamente.\n\n` +
-      '⚠️ No pudimos importar productos del catálogo automáticamente. ' +
+
+    let msg = '✅ *¡Configuración completada!*\n\n' +
+      `*${business.business_name}* quedó registrado correctamente.\n\n`;
+
+    if (trialSub) {
+      msg += `🆓 *Prueba gratuita activada: Plan ${trialSub.plan.name}*\n` +
+        `Tenés 30 días gratis con IA, resumen diario, promos y más.\n` +
+        `Vence: ${trialEndStr}\n\n`;
+    }
+
+    msg += '⚠️ No pudimos importar productos del catálogo automáticamente. ' +
       'El administrador de la plataforma los importará manualmente. ' +
       'Te avisaremos cuando tu negocio esté listo para recibir pedidos.\n\n' +
       '🤖 Mientras tanto, podés preguntarme lo que necesites.\n' +
-      'Escribí *AYUDA* para ver las opciones disponibles.'
-    );
+      'Escribí *AYUDA* para ver las opciones disponibles.';
+
+    return sendMessage(pc, phone, msg);
   }
 
   if (normalized === 'EDITAR') {
@@ -555,6 +615,21 @@ function sendEditMenu(pc, phone) {
 // ══════════════════════════════════════
 
 async function handleCommand(pc, phone, text, businessId) {
+  // 0. Check subscription expiry — notify admin but allow subscription commands
+  const activeSub = await subscription.getActiveSubscription(businessId);
+  const normalizedUpper = text.trim().toUpperCase();
+  const isSubCommand = /^(PLAN|PLANES|RENOVAR|CAMBIAR\s+PLAN)/i.test(normalizedUpper);
+  const isSuperAdmin = phone === config.alertPhone;
+
+  if (!activeSub && !isSubCommand && !isSuperAdmin) {
+    await sendMessage(pc, phone,
+      '⚠️ *Tu suscripción expiró.*\n\n' +
+      'Tus clientes no pueden hacer pedidos hasta que renueves.\n' +
+      'Enviá *PLAN* para ver tu estado o *RENOVAR* para pagar.'
+    );
+    return;
+  }
+
   // 1. Try exact commands first (order commands with #N need precision)
   const parsed = parseCommand(text);
 
@@ -563,14 +638,23 @@ async function handleCommand(pc, phone, text, businessId) {
     return executeIntent(pc, phone, parsed.command.toLowerCase(), parsed.args || {}, business, businessId);
   }
 
-  // 2. No exact command matched — use AI to classify intent
+  // 2. Check if AI is enabled for this business's plan
+  const hasAI = await subscription.checkFeatureAccess(businessId, 'ai_enabled');
   const business = await db.getBusinessById(businessId);
 
+  if (!hasAI) {
+    // Basic plan: no AI — respond with unrecognized command message
+    return sendMessage(pc, phone,
+      '⚠️ Comando no reconocido. Enviá *AYUDA* para ver los comandos disponibles.'
+    );
+  }
+
+  // 3. AI-enabled plan — use AI to classify intent
   console.log(`🤖 AI intent classification for: "${text.substring(0, 80)}"`);
   const { intent, args } = await ai.classifyAdminIntent(text);
   console.log(`🤖 AI classified intent: ${intent}`, args || '');
 
-  // 3. Handle AI-classified intents
+  // 4. Handle AI-classified intents
   if (intent === 'general_question' || intent === 'help') {
     const context = await buildBusinessContext(businessId, business);
     const answer = await ai.answerAdminQuestion(text, context);
@@ -593,8 +677,25 @@ async function handleCommand(pc, phone, text, businessId) {
  */
 async function executeIntent(pc, phone, intent, args, business, businessId) {
   switch (intent) {
-    case 'ayuda':
-      return sendMessage(pc, phone, helpText());
+    case 'ayuda': {
+      const sub = await subscription.getActiveSubscription(businessId);
+      const hasAI = sub?.plan?.ai_enabled || false;
+      return sendMessage(pc, phone, helpText(hasAI));
+    }
+
+    case 'add_product': {
+      const contactPhone = config.alertPhone || 'soporte';
+      return sendMessage(pc, phone,
+        '📦 *Agregar producto al catálogo*\n\n' +
+        'Para agregar un producto nuevo, envianos la siguiente info a:\n' +
+        `📲 *${contactPhone}*\n\n` +
+        '• Nombre del producto\n' +
+        '• Precio\n' +
+        '• Descripción (opcional)\n' +
+        '• Foto del producto\n\n' +
+        'Nosotros lo cargamos en tu catálogo y queda listo para que tus clientes lo vean.'
+      );
+    }
 
     case 'edit_name': {
       await db.updateUserStep(phone, STEPS.EDIT_NAME);
@@ -670,6 +771,22 @@ async function executeIntent(pc, phone, intent, args, business, businessId) {
         'Escribí *CANCELAR* para salir.'
       );
     }
+    case 'edit_product': {
+      await db.updateUserStep(phone, STEPS.EDIT_PRODUCT_SELECT);
+      const products = await db.getProductsByBusiness(businessId);
+      if (products.length === 0) {
+        await db.updateUserStep(phone, STEPS.COMPLETED);
+        return sendMessage(pc, phone, '📦 Tu menú está vacío.');
+      }
+      if (products.length <= 10) {
+        return sendProductList(pc, phone, products, '✏️ *¿Qué producto querés editar?*', 'Elegir producto');
+      }
+      return sendMessage(pc, phone,
+        '✏️ *¿Qué producto querés editar?*\n\n' +
+        'Escribí el nombre del producto (ej: "pizza muzzarella").\n\n' +
+        'Escribí *CANCELAR* para salir.'
+      );
+    }
     case 'view_menu':
       return sendMessage(pc, phone, await buildViewMenu(businessId));
     case 'view_business':
@@ -689,6 +806,353 @@ async function executeIntent(pc, phone, intent, args, business, businessId) {
     case 'sales_summary': {
       const period = args.period || 'hoy';
       return handleSalesSummary(pc, phone, businessId, period);
+    }
+
+    // ── Subscription commands ──
+    case 'view_plan': {
+      const sub = await subscription.getActiveSubscription(businessId);
+      let text = subscription.formatPlanInfo(sub);
+      if (sub?.plan) {
+        const month = new Date().toISOString().slice(0, 7);
+        const countRow = await db.getMonthlyOrderCount(businessId, month);
+        const current = countRow ? countRow.order_count : 0;
+        const limit = sub.plan.monthly_order_limit;
+        text += `\n\n📊 *Uso este mes:* ${current}/${limit || '∞'} pedidos`;
+      }
+      return sendMessage(pc, phone, text);
+    }
+    case 'view_plans': {
+      const plans = await db.getSubscriptionPlans();
+      return sendMessage(pc, phone, subscription.formatPlansComparison(plans));
+    }
+    case 'renew': {
+      const sub = await subscription.getActiveSubscription(businessId);
+      const plans = await db.getSubscriptionPlans();
+      let msg = '💳 *Renovar Suscripción*\n\n';
+      if (sub?.plan) {
+        msg += `Tu plan actual: *${sub.plan.name}* (vence ${new Date(sub.end_date).toLocaleDateString('es-AR')})\n\n`;
+      }
+      msg += '*Planes disponibles:*\n';
+      for (const p of plans) {
+        msg += `• *${p.name}* — $${p.price_usd} USD/mes\n`;
+      }
+      msg += '\n*Para pagar:*\n';
+      msg += '1. Transferí el monto a:\n';
+      msg += `   📲 Contactá al soporte: ${config.alertPhone || 'No configurado'}\n`;
+      msg += '2. Enviá el comprobante de pago\n';
+      msg += '3. Indicá qué plan querés\n\n';
+      msg += 'O enviá *CAMBIAR PLAN basico/intermedio/pro* para solicitar un cambio.';
+      return sendMessage(pc, phone, msg);
+    }
+    case 'change_plan': {
+      const { planSlug } = args;
+      if (!planSlug) {
+        const plans = await db.getSubscriptionPlans();
+        let msg = '📋 *¿A qué plan querés cambiar?*\n\n';
+        for (const p of plans) {
+          msg += `• *${p.name}* — $${p.price_usd} USD/mes\n`;
+        }
+        msg += '\nEscribí *CAMBIAR PLAN basico*, *CAMBIAR PLAN intermedio* o *CAMBIAR PLAN pro*';
+        return sendMessage(pc, phone, msg);
+      }
+      const plan = await db.getPlanBySlug(planSlug);
+      if (!plan) {
+        return sendMessage(pc, phone, '⚠️ Plan no encontrado. Opciones: *basico*, *intermedio*, *pro*');
+      }
+      // Notify super-admin about plan change request
+      if (config.alertPhone) {
+        const biz = business || await db.getBusinessById(businessId);
+        await sendMessage(pc, config.alertPhone,
+          `📋 *Solicitud de cambio de plan*\n\n` +
+          `Negocio: ${biz.business_name}\n` +
+          `Admin: ${phone}\n` +
+          `Plan solicitado: *${plan.name}* ($${plan.price_usd} USD/mes)\n\n` +
+          `Para activar: *CONFIRMAR PAGO ${phone} ${planSlug}*`
+        );
+      }
+      return sendMessage(pc, phone,
+        `✅ *Solicitud enviada*\n\n` +
+        `Plan: *${plan.name}* — $${plan.price_usd} USD/mes\n\n` +
+        `Nuestro equipo procesará tu solicitud. ` +
+        `Si ya transferiste, enviá el comprobante y lo activamos.`
+      );
+    }
+
+    // ── Promo code commands (Intermediate + Pro) ──
+    case 'create_promo': {
+      const hasPromos = await subscription.checkFeatureAccess(businessId, 'promo_codes');
+      if (!hasPromos) {
+        return sendMessage(pc, phone, '⚠️ Los códigos de descuento están disponibles en los planes *Intermedio* y *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const { code, discountType, discountValue, maxUses } = args || {};
+      if (!code || !discountType || !discountValue) {
+        return sendMessage(pc, phone,
+          '🎟️ *Crear código de descuento*\n\n' +
+          'Formato: *CREAR PROMO código 10%* o *CREAR PROMO código $500*\n' +
+          'Opcional: agregar límite de usos al final\n\n' +
+          'Ejemplos:\n' +
+          '• *CREAR PROMO VERANO 10%*\n' +
+          '• *CREAR PROMO AMIGOS $500 50*'
+        );
+      }
+      try {
+        const promo = await promos.createPromo(businessId, code, discountType, discountValue, maxUses);
+        const discountLabel = discountType === 'percent' ? `${discountValue}%` : `$${discountValue}`;
+        const usesLabel = maxUses ? `${maxUses} usos máx.` : 'Usos ilimitados';
+        return sendMessage(pc, phone,
+          `✅ *Promo creada*\n\n` +
+          `Código: *${promo.code}*\n` +
+          `Descuento: ${discountLabel}\n` +
+          `${usesLabel}`
+        );
+      } catch (err) {
+        if (err.code === '23505') {
+          return sendMessage(pc, phone, `⚠️ Ya existe un código *${code}* para tu negocio.`);
+        }
+        throw err;
+      }
+    }
+    case 'view_promos': {
+      const hasPromos = await subscription.checkFeatureAccess(businessId, 'promo_codes');
+      if (!hasPromos) {
+        return sendMessage(pc, phone, '⚠️ Los códigos de descuento están disponibles en los planes *Intermedio* y *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const activePromos = await promos.getActivePromos(businessId);
+      return sendMessage(pc, phone, promos.formatPromoList(activePromos));
+    }
+
+    // ── Analytics ──
+    case 'analytics': {
+      const limit = await analytics.checkAnalyticsLimit(businessId);
+      if (!limit.allowed) {
+        if (limit.limit === 0) {
+          return sendMessage(pc, phone, '⚠️ Las consultas analytics están disponibles en los planes *Intermedio* y *Pro*.\nEnviá *PLANES* para ver opciones.');
+        }
+        return sendMessage(pc, phone,
+          `⚠️ Alcanzaste tu límite de consultas analytics este mes (${limit.current}/${limit.limit}).\n` +
+          `Enviá *PLANES* para ver opciones de upgrade.`
+        );
+      }
+      const report = await analytics.buildFullReport(businessId);
+      await analytics.incrementUsage(businessId);
+      const remaining = limit.limit ? `\n\n📊 Consultas restantes: ${limit.limit - limit.current - 1}/${limit.limit}` : '';
+      return sendMessage(pc, phone, report + remaining);
+    }
+
+    case 'trends': {
+      const hasTrends = await subscription.checkFeatureAccess(businessId, 'trends');
+      if (!hasTrends) {
+        return sendMessage(pc, phone, '⚠️ Las tendencias están disponibles en el plan *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const trendsReport = await analytics.buildTrendsReport(businessId);
+      return sendMessage(pc, phone, trendsReport);
+    }
+
+    // ── Scheduled messages (Pro only) ──
+    case 'schedule_message': {
+      const hasScheduled = await subscription.checkFeatureAccess(businessId, 'scheduled_messages');
+      if (!hasScheduled) {
+        return sendMessage(pc, phone, '⚠️ Los mensajes programados están disponibles en el plan *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const { day, month: m, hour, minute, message: msgText } = args;
+      if (!msgText || msgText.length < 3) {
+        return sendMessage(pc, phone, '⚠️ Formato: *PROGRAMAR MENSAJE dd/mm HH:MM tu mensaje*\nEj: PROGRAMAR MENSAJE 20/02 18:00 ¡Hoy tenemos promo 2x1!');
+      }
+      const year = new Date().getFullYear();
+      const sendAt = new Date(year, m - 1, day, hour, minute);
+      if (sendAt <= new Date()) {
+        return sendMessage(pc, phone, '⚠️ La fecha debe ser en el futuro.');
+      }
+      const customers = await db.getUniqueCustomerPhones(businessId);
+      if (customers.length === 0) {
+        return sendMessage(pc, phone, '⚠️ No tenés clientes aún. Los mensajes se envían a clientes que hayan hecho pedidos.');
+      }
+      const scheduled = await db.createScheduledMessage(businessId, msgText, customers, sendAt);
+      const dateStr = sendAt.toLocaleString('es-AR', { timeZone: config.timezone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+      return sendMessage(pc, phone,
+        `✅ *Mensaje programado*\n\n` +
+        `📅 Envío: ${dateStr}\n` +
+        `👥 Destinatarios: ${customers.length} clientes\n` +
+        `💬 Mensaje: "${msgText}"`
+      );
+    }
+    case 'view_scheduled': {
+      const hasScheduled = await subscription.checkFeatureAccess(businessId, 'scheduled_messages');
+      if (!hasScheduled) {
+        return sendMessage(pc, phone, '⚠️ Los mensajes programados están disponibles en el plan *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const pending = await db.getScheduledMessagesByBusiness(businessId);
+      if (pending.length === 0) {
+        return sendMessage(pc, phone, '📅 No tenés mensajes programados.');
+      }
+      let msg = '📅 *Mensajes programados:*\n\n';
+      for (const m of pending) {
+        const dateStr = new Date(m.send_at).toLocaleString('es-AR', { timeZone: config.timezone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+        const phones = m.recipient_phones || [];
+        msg += `• ${dateStr} — ${phones.length} destinatarios\n  "${m.message.substring(0, 50)}${m.message.length > 50 ? '...' : ''}"\n\n`;
+      }
+      return sendMessage(pc, phone, msg);
+    }
+
+    // ── Broadcast (Pro only) ──
+    case 'broadcast': {
+      const hasBroadcasts = await subscription.checkFeatureAccess(businessId, 'broadcasts');
+      if (!hasBroadcasts) {
+        return sendMessage(pc, phone, '⚠️ Las difusiones están disponibles en el plan *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const { message: broadcastMsg } = args || {};
+      if (!broadcastMsg || broadcastMsg.length < 3) {
+        return sendMessage(pc, phone,
+          '📢 *Enviar difusión a todos tus clientes*\n\n' +
+          'Formato: *DIFUSION tu mensaje aquí*\n' +
+          'Ej: *DIFUSION ¡Hoy tenemos promo 2x1 en pizzas!*'
+        );
+      }
+      const customers = await db.getUniqueCustomerPhones(businessId);
+      if (customers.length === 0) {
+        return sendMessage(pc, phone, '⚠️ No tenés clientes aún. Las difusiones se envían a clientes que hayan hecho pedidos.');
+      }
+      await sendMessage(pc, phone, `📢 Enviando difusión a ${customers.length} clientes...`);
+
+      const biz = business || await db.getBusinessById(businessId);
+      const fullMsg = `📢 *${biz.business_name}*\n\n${broadcastMsg}`;
+      let sentCount = 0;
+      let failedCount = 0;
+
+      for (const custPhone of customers) {
+        try {
+          // Try free-form message first (works within 24h window)
+          await sendMessage(pc, custPhone, fullMsg);
+          sentCount++;
+        } catch (err) {
+          // Outside 24h window — try template as fallback
+          try {
+            await sendTemplate(pc, custPhone);
+            sentCount++;
+          } catch (templateErr) {
+            console.error(`❌ Broadcast failed for ${custPhone}:`, templateErr.message);
+            failedCount++;
+          }
+        }
+      }
+
+      return sendMessage(pc, phone,
+        `✅ *Difusión completada*\n\n` +
+        `📨 Enviados: ${sentCount}/${customers.length}\n` +
+        (failedCount > 0 ? `❌ Fallidos: ${failedCount}\n` : '') +
+        `💬 "${broadcastMsg.substring(0, 80)}${broadcastMsg.length > 80 ? '...' : ''}"`
+      );
+    }
+
+    // ── Loyalty (Pro only) ──
+    case 'configure_loyalty': {
+      const hasLoyalty = await subscription.checkFeatureAccess(businessId, 'loyalty');
+      if (!hasLoyalty) {
+        return sendMessage(pc, phone, '⚠️ El programa de fidelización está disponible en el plan *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const { threshold, rewardType, rewardValue } = args || {};
+      if (!threshold || threshold < 2) {
+        return sendMessage(pc, phone,
+          '⚠️ Formato: *CONFIGURAR FIDELIDAD N pedidos = recompensa*\n\n' +
+          'Ejemplos:\n' +
+          '• *CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis*\n' +
+          '• *CONFIGURAR FIDELIDAD 5 pedidos = 15%*\n' +
+          '• *CONFIGURAR FIDELIDAD 8 pedidos = $500*'
+        );
+      }
+      await db.upsertLoyaltyConfig(businessId, threshold, rewardType, rewardValue);
+      const label = loyalty.formatRewardLabel({ threshold, reward_type: rewardType, reward_value: rewardValue });
+      return sendMessage(pc, phone,
+        `✅ *Programa de fidelidad configurado*\n\n🏆 ${label}\n\n` +
+        'Los clientes acumulan pedidos automáticamente y reciben su recompensa al alcanzar la meta.'
+      );
+    }
+    case 'view_loyalty': {
+      const hasLoyalty = await subscription.checkFeatureAccess(businessId, 'loyalty');
+      if (!hasLoyalty) {
+        return sendMessage(pc, phone, '⚠️ El programa de fidelización está disponible en el plan *Pro*.\nEnviá *PLANES* para ver opciones.');
+      }
+      const loyaltyConfig = await db.getLoyaltyConfig(businessId);
+      if (!loyaltyConfig) {
+        return sendMessage(pc, phone,
+          '🏆 No tenés un programa de fidelidad configurado.\n\n' +
+          'Configuralo con: *CONFIGURAR FIDELIDAD 10 pedidos = 1 gratis*'
+        );
+      }
+      const label = loyalty.formatRewardLabel(loyaltyConfig);
+      return sendMessage(pc, phone,
+        `🏆 *Programa de fidelidad*\n\n` +
+        `Regla: ${label}\n\n` +
+        'Los clientes acumulan pedidos automáticamente.'
+      );
+    }
+
+    // ── Super-admin commands (ALERT_PHONE only) ──
+    case 'super_confirm_payment': {
+      if (phone !== config.alertPhone) {
+        return sendMessage(pc, phone, '⚠️ Este comando es solo para el administrador de la plataforma.');
+      }
+      const { adminPhone, planSlug } = args;
+      const targetBiz = await db.getBusinessByAdminPhone(adminPhone);
+      if (!targetBiz) {
+        return sendMessage(pc, phone, `⚠️ No se encontró negocio con el teléfono ${adminPhone}`);
+      }
+      const activated = await subscription.confirmPayment(targetBiz.id, planSlug, 1);
+      return sendMessage(pc, phone,
+        `✅ *Suscripción activada*\n\n` +
+        `Negocio: ${targetBiz.business_name}\n` +
+        `Plan: *${activated.plan.name}* ($${activated.plan.price_usd} USD/mes)\n` +
+        `Vence: ${new Date(activated.end_date).toLocaleDateString('es-AR')}\n` +
+        `Admin: ${adminPhone}`
+      );
+    }
+    case 'view_subscriptions': {
+      if (phone !== config.alertPhone) {
+        return sendMessage(pc, phone, '⚠️ Este comando es solo para el administrador de la plataforma.');
+      }
+      const businesses = await db.getAllBusinessesWithSubscriptions();
+      if (businesses.length === 0) {
+        return sendMessage(pc, phone, '📋 No hay negocios registrados.');
+      }
+      let msg = '📋 *Suscripciones*\n\n';
+      for (const biz of businesses) {
+        const sub = biz.subscription;
+        const planName = sub?.plan?.name || 'Sin plan';
+        const status = sub?.status || 'none';
+        const endStr = sub?.end_date ? new Date(sub.end_date).toLocaleDateString('es-AR') : '—';
+        msg += `*${biz.business_name}*\n`;
+        msg += `  Plan: ${planName} | Estado: ${status} | Vence: ${endStr}\n`;
+        msg += `  Tel: ${biz.admin_phone}\n\n`;
+      }
+      return sendMessage(pc, phone, msg);
+    }
+    case 'view_expired': {
+      if (phone !== config.alertPhone) {
+        return sendMessage(pc, phone, '⚠️ Este comando es solo para el administrador de la plataforma.');
+      }
+      const { expired, expiringSoon } = await db.getExpiringSubscriptions(7);
+      let msg = '⚠️ *Suscripciones expiradas y por vencer*\n\n';
+      if (expired.length === 0 && expiringSoon.length === 0) {
+        return sendMessage(pc, phone, '✅ No hay suscripciones expiradas ni por vencer.');
+      }
+      if (expired.length > 0) {
+        msg += '❌ *Expiradas:*\n';
+        for (const s of expired) {
+          const bizName = s.business?.business_name || 'Desconocido';
+          const adminPh = s.business?.admin_phone || '?';
+          msg += `• ${bizName} — venció ${new Date(s.end_date).toLocaleDateString('es-AR')} (${adminPh})\n`;
+        }
+        msg += '\n';
+      }
+      if (expiringSoon.length > 0) {
+        msg += '⏳ *Vencen pronto (7 días):*\n';
+        for (const s of expiringSoon) {
+          const bizName = s.business?.business_name || 'Desconocido';
+          const adminPh = s.business?.admin_phone || '?';
+          msg += `• ${bizName} — vence ${new Date(s.end_date).toLocaleDateString('es-AR')} (${adminPh})\n`;
+        }
+      }
+      return sendMessage(pc, phone, msg);
     }
 
     default: {
@@ -858,6 +1322,18 @@ async function handleEditZones(pc, phone, text, businessId) {
   if (!zones) {
     return sendMessage(pc, phone, '⚠️ Necesito el precio para cada zona. Probá así:\n"Centro $500, Almagro $600, Caballito $800"\n\nO escribí *CANCELAR* para salir.');
   }
+
+  // Check zone limit
+  const sub = await subscription.getActiveSubscription(businessId);
+  const zoneLimit = sub?.plan?.delivery_zone_limit || 3;
+  if (zones.length > zoneLimit) {
+    return sendMessage(pc, phone,
+      `⚠️ Tu plan permite hasta *${zoneLimit}* zonas de delivery. ` +
+      `Estás intentando agregar ${zones.length}.\n\n` +
+      `Enviá *PLANES* para ver opciones de upgrade.`
+    );
+  }
+
   await db.replaceZones(businessId, zones);
   await db.updateUserStep(phone, STEPS.COMPLETED);
   const zoneLines = zones.map((z) => `• ${z.zone_name} — $${z.price}`).join('\n');
@@ -1468,6 +1944,186 @@ async function handleSalesSummary(pc, phone, businessId, period) {
   return sendMessage(pc, phone, lines.join('\n'));
 }
 
+// ── EDIT PRODUCT flow (3 steps: select → choose field → enter value) ──
+
+async function handleEditProductSelect(pc, phone, text, businessId) {
+  if (text.trim().toUpperCase() === 'CANCELAR') {
+    editProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '❌ Operación cancelada.');
+  }
+
+  const products = await db.getProductsByBusiness(businessId);
+  let selected = null;
+
+  const num = parseInt(text.trim(), 10);
+  if (!isNaN(num) && num >= 1 && num <= products.length) {
+    selected = products[num - 1];
+  }
+
+  if (!selected) {
+    const input = text.trim().toLowerCase();
+    selected = products.find((p) => p.name.toLowerCase() === input)
+      || products.find((p) => p.name.toLowerCase().includes(input))
+      || products.find((p) => input.includes(p.name.toLowerCase()));
+  }
+
+  if (!selected) {
+    if (products.length <= 10) {
+      return sendMessage(pc, phone, `⚠️ Respondé con un número del 1 al ${products.length}, o *CANCELAR*.`);
+    }
+    return sendMessage(pc, phone,
+      '⚠️ No encontré ese producto.\n\n' +
+      'Escribí el nombre tal como aparece en tu menú.\n' +
+      'Escribí *CANCELAR* para salir.'
+    );
+  }
+
+  editProductSelection.set(phone, { productId: selected.id });
+  await db.updateUserStep(phone, STEPS.EDIT_PRODUCT_FIELD);
+
+  return sendButtons(pc, phone,
+    `✏️ *${selected.name}* — $${selected.price}\n${selected.description || '(sin descripción)'}\n\n¿Qué querés modificar?`,
+    [
+      { id: 'NOMBRE', title: 'Nombre' },
+      { id: 'PRECIO', title: 'Precio' },
+      { id: 'DESCRIPCION', title: 'Descripción' },
+    ]
+  );
+}
+
+async function handleEditProductField(pc, phone, text, businessId) {
+  const normalized = text.trim().toUpperCase();
+
+  if (normalized === 'CANCELAR') {
+    editProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '❌ Operación cancelada.');
+  }
+
+  const selection = editProductSelection.get(phone);
+  if (!selection) {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '⚠️ Algo salió mal. Usá *EDITAR PRODUCTO* de nuevo.');
+  }
+
+  const fieldMap = {
+    'NOMBRE': 'name',
+    '1': 'name',
+    'PRECIO': 'price',
+    '2': 'price',
+    'DESCRIPCION': 'description',
+    'DESCRIPCIÓN': 'description',
+    '3': 'description',
+  };
+
+  const field = fieldMap[normalized];
+  if (!field) {
+    return sendButtons(pc, phone,
+      '⚠️ Elegí una opción:',
+      [
+        { id: 'NOMBRE', title: 'Nombre' },
+        { id: 'PRECIO', title: 'Precio' },
+        { id: 'DESCRIPCION', title: 'Descripción' },
+      ]
+    );
+  }
+
+  selection.field = field;
+  editProductSelection.set(phone, selection);
+  await db.updateUserStep(phone, STEPS.EDIT_PRODUCT_VALUE);
+
+  const prompts = {
+    name: '✏️ Escribí el nuevo *nombre* del producto:',
+    price: '✏️ Escribí el nuevo *precio* (solo el número, ej: 5500):',
+    description: '✏️ Escribí la nueva *descripción* del producto:',
+  };
+
+  return sendMessage(pc, phone, prompts[field] + '\n\nO escribí *CANCELAR* para salir.');
+}
+
+async function handleEditProductValue(pc, phone, text, businessId) {
+  if (text.trim().toUpperCase() === 'CANCELAR') {
+    editProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '❌ Operación cancelada.');
+  }
+
+  const selection = editProductSelection.get(phone);
+  if (!selection || !selection.field) {
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '⚠️ Algo salió mal. Usá *EDITAR PRODUCTO* de nuevo.');
+  }
+
+  const { productId, field } = selection;
+  const products = await db.getProductsByBusiness(businessId);
+  const product = products.find((p) => p.id === productId);
+
+  if (!product) {
+    editProductSelection.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '⚠️ Producto no encontrado. Usá *EDITAR PRODUCTO* de nuevo.');
+  }
+
+  // Validate and prepare the update
+  const update = {};
+  let displayValue;
+
+  if (field === 'price') {
+    const price = parseFloat(text.trim().replace(/[^0-9.,]/g, '').replace(',', '.'));
+    if (isNaN(price) || price <= 0) {
+      return sendMessage(pc, phone, '⚠️ Ingresá un precio válido (solo números, ej: 5500).');
+    }
+    update.price = Math.round(price);
+    displayValue = `$${update.price}`;
+  } else if (field === 'name') {
+    const name = text.trim();
+    if (name.length < 2) {
+      return sendMessage(pc, phone, '⚠️ El nombre debe tener al menos 2 caracteres.');
+    }
+    update.name = name;
+    displayValue = name;
+  } else {
+    update.description = text.trim();
+    displayValue = text.trim();
+  }
+
+  // Update in local DB
+  await db.updateProduct(productId, update);
+
+  // Try to update in Meta catalog too
+  let catalogNote = '';
+  if (product.retailer_id) {
+    try {
+      const business = await db.getBusinessById(businessId);
+      if (business?.phone_number_id) {
+        const phoneConfig = await db.getPhoneConfigById(business.phone_number_id);
+        if (phoneConfig?.catalogId && phoneConfig?.token) {
+          await updateProductFields(
+            phoneConfig.token,
+            phoneConfig.catalogId,
+            product.retailer_id,
+            update
+          );
+          catalogNote = '\n📋 Catálogo de WhatsApp actualizado.';
+        }
+      }
+    } catch (err) {
+      console.error('⚠️ Failed to update Meta catalog:', err.message);
+      catalogNote = '\n⚠️ No se pudo actualizar el catálogo de WhatsApp. Los cambios se ven en el menú del bot.';
+    }
+  }
+
+  editProductSelection.delete(phone);
+  await db.updateUserStep(phone, STEPS.COMPLETED);
+
+  const fieldLabels = { name: 'Nombre', price: 'Precio', description: 'Descripción' };
+  return sendMessage(pc, phone,
+    `✅ *${product.name}* actualizado\n\n` +
+    `${fieldLabels[field]}: *${displayValue}*${catalogNote}`
+  );
+}
+
 // Step: SINCRONIZAR — re-sync products from Meta catalog
 async function handleSyncCatalog(pc, phone, business) {
   if (!business.phone_number_id) {
@@ -1505,22 +2161,52 @@ async function handleSyncCatalog(pc, phone, business) {
 // VIEW COMMANDS
 // ══════════════════════════════════════
 
-function helpText() {
-  return '🤖 *¡Soy tu asistente!*\n\n' +
-    'Podés escribirme lo que necesites de forma natural, por ejemplo:\n\n' +
-    '💬 *Preguntame cosas como:*\n' +
-    '• "Quiero cambiar el horario"\n' +
-    '• "Cuántos pedidos tengo hoy?"\n' +
-    '• "Cuánto vendí esta semana?"\n' +
-    '• "Cómo agrego un producto?"\n' +
-    '• "Quiero ver mi configuración"\n\n' +
-    '📋 *Comandos rápidos:*\n' +
-    '• *PAUSAR PRODUCTO* — Activar/desactivar un producto\n' +
-    '• *SINCRONIZAR* — Actualizar productos del catálogo\n' +
-    '• *CONFIRMAR PAGO #N* — Confirmar pago de un pedido\n' +
+function helpText(hasAI = true) {
+  if (hasAI) {
+    return '🤖 *¡Soy tu asistente!*\n\n' +
+      'Podés escribirme lo que necesites de forma natural, por ejemplo:\n\n' +
+      '💬 *Preguntame cosas como:*\n' +
+      '• "Quiero cambiar el horario"\n' +
+      '• "Cuántos pedidos tengo hoy?"\n' +
+      '• "Cuánto vendí esta semana?"\n' +
+      '• "Cómo agrego un producto?"\n' +
+      '• "Quiero ver mi configuración"\n\n' +
+      '📋 *Comandos rápidos:*\n' +
+      '• *PAUSAR PRODUCTO* — Activar/desactivar un producto\n' +
+      '• *SINCRONIZAR* — Actualizar productos del catálogo\n' +
+      '• *CONFIRMAR PAGO #N* — Confirmar pago de un pedido\n' +
+      '• *RECHAZAR PEDIDO #N* — Rechazar un pedido\n' +
+      '• *ESTADO PEDIDO #N preparando* — Cambiar estado\n\n' +
+      '💼 *Suscripción:*\n' +
+      '• *PLAN* — Ver tu plan actual y uso\n' +
+      '• *PLANES* — Comparar planes disponibles\n' +
+      '• *RENOVAR* — Instrucciones de pago\n' +
+      '• *CAMBIAR PLAN basico/intermedio/pro*\n\n' +
+      '💡 También podés escribir *AYUDA* en cualquier momento para ver este mensaje.';
+  }
+
+  // Basic plan: commands-only help
+  return '📋 *Comandos disponibles:*\n\n' +
+    '🛒 *Pedidos:*\n' +
+    '• *VER PEDIDOS* — Ver pedidos pendientes\n' +
+    '• *VER PEDIDO #N* — Detalle de un pedido\n' +
+    '• *ESTADO PEDIDO #N preparando* — Cambiar estado\n' +
+    '• *CONFIRMAR PAGO #N* — Confirmar pago recibido\n' +
     '• *RECHAZAR PEDIDO #N* — Rechazar un pedido\n' +
-    '• *ESTADO PEDIDO #N preparando* — Cambiar estado\n\n' +
-    '💡 También podés escribir *AYUDA* en cualquier momento para ver este mensaje.';
+    '• *VENTAS HOY/SEMANA/MES* — Resumen de ventas\n\n' +
+    '📦 *Productos:*\n' +
+    '• *VER MENÚ* — Ver tu menú\n' +
+    '• *AGREGAR PRODUCTO* — Solicitar agregar un producto\n' +
+    '• *EDITAR PRODUCTO* — Cambiar precio/nombre de un producto\n' +
+    '• *PAUSAR PRODUCTO* — Activar/desactivar un producto\n' +
+    '• *SINCRONIZAR* — Actualizar del catálogo\n\n' +
+    '⚙️ *Configuración:*\n' +
+    '• *VER NEGOCIO* — Ver tu configuración\n\n' +
+    '💼 *Suscripción:*\n' +
+    '• *PLAN* — Ver tu plan actual y uso\n' +
+    '• *PLANES* — Comparar planes disponibles\n' +
+    '• *RENOVAR* — Instrucciones de pago\n' +
+    '• *CAMBIAR PLAN basico/intermedio/pro*';
 }
 
 async function buildViewMenu(businessId) {
