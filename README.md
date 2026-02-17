@@ -49,3 +49,50 @@ Businesses onboard via WhatsApp → configure menu, hours, zones, payments → r
 🚧 Advance/instant order scheduling (in progress)
 
 ## Project Structure (simplified)
+
+```text
+src/
+├── config/             # constants, steps, plans
+├── services/
+│   ├── database.js     # Supabase client & queries
+│   ├── whatsapp.js     # Meta API send helpers (dynamic credentials)
+│   ├── groq.js         # Fast JSON chat completions
+│   ├── subscription.js # Plan checks & gating
+│   ├── analytics.js
+│   └── ...             # other services
+├── workflows/
+│   ├── registration.js
+│   ├── admin-workflow.js
+│   ├── customer-workflow.js
+│   └── ...             # other workflows
+└── scripts/            # CLI helpers
+    ├── setup-number.js
+    ├── set-profile.js
+    ├── generate-codes.js
+    └── ...
+```
+## Setup (Development)
+
+1. Clone repo
+2. `npm install`
+3. Copy `.env.example` → `.env` and fill:
+   - `SUPABASE_URL` & `SUPABASE_KEY`
+   - `GROQ_API_KEY`
+   - (optional) default `META_PHONE_NUMBER_ID` / `META_ACCESS_TOKEN` for dev mode
+4. Run migrations (SQL files in `/sql`)
+5. `npm run dev`
+
+> Production uses **database-stored credentials** per phone number (see `getPhoneConfig()` logic).
+
+## Important Notes
+
+- Uses **official Meta WhatsApp Business Platform Cloud API** (no Twilio anymore)
+- Complies with Meta policies: webhook signature validation, opt-in, template usage where required
+- Designed for **Argentina**: transfer/deposit payments, local Spanish, delivery zones with prices
+- **Not** a generic open-source bot — business SaaS platform with monetization logic
+
+## License
+
+Private / proprietary © 2026 — contact for licensing, white-label, or collaboration opportunities.
+
+Made with ❤️ for Argentine emprendedores.
