@@ -518,6 +518,7 @@ async function createOrder(order) {
       payment_method: order.payment_method,
       deposit_amount: order.deposit_amount || null,
       notes: order.notes || null,
+      delivery_date: order.delivery_date || null,
     })
     .select()
     .single();
@@ -1080,6 +1081,33 @@ async function claimLoyaltyReward(cardId) {
   if (error) throw error;
 }
 
+// ── Order Mode ──
+
+async function getBusinessOrderMode(businessId) {
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('order_mode, min_advance_days, max_advance_days')
+    .eq('id', businessId)
+    .single();
+
+  if (error && error.code !== 'PGRST116') throw error;
+  return data || { order_mode: 'instant', min_advance_days: 1, max_advance_days: 30 };
+}
+
+async function updateBusinessOrderMode(businessId, { order_mode, min_advance_days, max_advance_days }) {
+  const update = { updated_at: new Date().toISOString() };
+  if (order_mode != null) update.order_mode = order_mode;
+  if (min_advance_days != null) update.min_advance_days = min_advance_days;
+  if (max_advance_days != null) update.max_advance_days = max_advance_days;
+
+  const { error } = await supabase
+    .from('businesses')
+    .update(update)
+    .eq('id', businessId);
+
+  if (error) throw error;
+}
+
 module.exports = {
   // Health & logging
   healthCheck,
@@ -1162,4 +1190,7 @@ module.exports = {
   getLoyaltyCard,
   incrementLoyaltyCard,
   claimLoyaltyReward,
+  // Order mode
+  getBusinessOrderMode,
+  updateBusinessOrderMode,
 };

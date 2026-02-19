@@ -339,20 +339,20 @@
 - [x] 205. Test: super-admin confirms payment → subscription activates ✅
 - [x] 206. Test: `PLAN`, `PLANES`, `RENOVAR` commands return correct info ✅
 
-## Phase 39 — Order Scheduling (Instant vs Advance Orders)
-- [ ] 207. Add `order_mode` (`'instant'` | `'advance'`), `min_advance_days`, `max_advance_days` columns to `businesses` table
-- [ ] 208. Add `delivery_date` column to `orders` table
-- [ ] 209. Create SQL migration file `sql/add-order-scheduling.sql`
-- [ ] 210. Add `DELIVERY_DATE` step to `CUSTOMER_STEPS` in `src/config/index.js`
-- [ ] 211. Add `EDIT_ORDER_MODE` step to admin `STEPS` in `src/config/index.js`
-- [ ] 212. Update `db.createOrder()` in `src/services/database.js` to accept and store `delivery_date`
-- [ ] 213. New `handleCustomerDeliveryDate()` in `src/services/customer-workflow.js` — show available dates as interactive list, validate min/max range
-- [ ] 214. After delivery address step: if `order_mode='instant'` skip date step (current behavior), if `'advance'` transition to DELIVERY_DATE
-- [ ] 215. Update `showOrderSummaryAndPayment()` — display delivery date in order summary when set
-- [ ] 216. Update `confirmAndSaveOrder()` — pass `delivery_date` to `db.createOrder()` and include in admin notification
-- [ ] 217. Add admin command `PEDIDOS` in `src/services/workflow.js` — toggle between instant/advance mode, configure min/max days
-- [ ] 218. Add `handleEditOrderMode()` handler for the EDIT_ORDER_MODE step
-- [ ] 219. Update `buildReviewSummary()` to show order mode configuration
+## Phase 39 — Order Scheduling (Instant vs Advance Orders) ✅
+- [x] 207. Add `order_mode` (`'instant'` | `'advance'`), `min_advance_days`, `max_advance_days` columns to `businesses` table
+- [x] 208. Add `delivery_date` column to `orders` table
+- [x] 209. Create SQL migration file `sql/add-order-scheduling.sql`
+- [x] 210. Add `DELIVERY_DATE` step to `CUSTOMER_STEPS` in `src/config/index.js`
+- [x] 211. Add `EDIT_ORDER_MODE` step to admin `STEPS` in `src/config/index.js`
+- [x] 212. Update `db.createOrder()` in `src/services/database.js` to accept and store `delivery_date`
+- [x] 213. New `handleCustomerDeliveryDate()` in `src/services/customer-workflow.js` — show available dates as interactive list, validate min/max range
+- [x] 214. After delivery address step: if `order_mode='instant'` skip date step (current behavior), if `'advance'` transition to DELIVERY_DATE
+- [x] 215. Update `showOrderSummaryAndPayment()` — display delivery date in order summary when set
+- [x] 216. Update `confirmAndSaveOrder()` — pass `delivery_date` to `db.createOrder()` and include in admin notification
+- [x] 217. Add admin command `PEDIDOS` in `src/services/workflow.js` — toggle between instant/advance mode, configure min/max days
+- [x] 218. Add `handleEditOrderMode()` handler for the EDIT_ORDER_MODE step
+- [x] 219. Update `buildReviewSummary()` to show order mode configuration
 - [ ] 220. Test: instant mode — customer flow unchanged, no date selection step
 - [ ] 221. Test: advance mode (min=3, max=30) — customer sees date picker, selects valid date, order saved with delivery_date
 - [ ] 222. Test: admin `PEDIDOS` command switches between modes correctly

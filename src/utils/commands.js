@@ -36,6 +36,7 @@ function parseCommand(text) {
     'CONFIGURAR FIDELIDAD': 'configure_loyalty',
     'EDITAR PRODUCTO': 'edit_product',
     'AGREGAR PRODUCTO': 'add_product',
+    'PEDIDOS': 'order_mode',
   };
 
   const command = commands[normalized];

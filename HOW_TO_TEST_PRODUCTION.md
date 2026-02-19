@@ -230,6 +230,32 @@ node scripts/sync-catalog.js
 
 ---
 
+## 13. Order Scheduling (Phase 39)
+
+**Goal:** Test instant vs advance order modes.
+
+### Test instant mode (default):
+1. Place a customer order normally — no date selection step should appear
+2. Order flow: cart → delivery → address → payment (unchanged)
+
+### Test advance mode:
+1. From admin phone, send `PEDIDOS` → see current mode + options
+2. Select "Por encargo" → enter day range (e.g., `3-30`)
+3. Should confirm: "Modo de pedidos: Por encargo (3-30 días)"
+4. Now place a customer order:
+   - After delivery address (or pickup selection), customer sees date picker list
+   - Select a date → date appears in order summary
+   - Complete order → date shown in confirmation + admin notification
+5. Check database: `SELECT delivery_date FROM orders ORDER BY created_at DESC LIMIT 1;`
+
+### Switch back:
+1. Admin sends `PEDIDOS` → select "Inmediato"
+2. Customer order flow returns to normal (no date step)
+
+**Pass if:** Date picker only shows in advance mode, date persists in order + notifications.
+
+---
+
 ## Quick Reference
 
 | # | Test | Time | Priority |
@@ -246,8 +272,9 @@ node scripts/sync-catalog.js
 | 10 | AI fallback | 5 min | Medium |
 | 11 | Admin scripts | 5 min | Low |
 | 12 | Catalog per business | 5 min | Low |
+| 13 | Order scheduling | 5 min | Medium |
 
-Total estimated time: ~45 minutes
+Total estimated time: ~50 minutes
 
 ---
 

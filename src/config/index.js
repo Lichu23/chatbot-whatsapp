@@ -82,6 +82,7 @@ const STEPS = {
   EDIT_PRODUCT_FIELD: 'edit_product_field',
   EDIT_PRODUCT_VALUE: 'edit_product_value',
   LINK_CATALOG: 'link_catalog',
+  EDIT_ORDER_MODE: 'edit_order_mode',
 };
 
 // Customer ordering flow steps
@@ -95,6 +96,7 @@ const CUSTOMER_STEPS = {
   ORDER_SUMMARY: 'c_order_summary',
   PAYMENT_METHOD: 'c_payment_method',
   AWAITING_TRANSFER: 'c_awaiting_transfer',
+  DELIVERY_DATE: 'c_delivery_date',
   ORDER_CONFIRMED: 'c_order_confirmed',
 };
 

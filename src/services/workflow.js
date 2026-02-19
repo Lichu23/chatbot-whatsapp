@@ -155,6 +155,8 @@ async function handleStep(pc, phone, text, state) {
       return handleEditProductValue(pc, phone, text, business_id);
     case STEPS.LINK_CATALOG:
       return handleLinkCatalog(pc, phone, text, business_id);
+    case STEPS.EDIT_ORDER_MODE:
+      return handleEditOrderMode(pc, phone, text, business_id);
 
     default:
       return sendMessage(pc, phone, '⚠️ Estado desconocido. Escribí *AYUDA*.');
@@ -464,6 +466,10 @@ async function buildReviewSummary(businessId) {
   }
   lines.push(`💳 Pagos: ${getPaymentLabel(business)}`);
   if (bank) lines.push(`🏦 Alias: ${bank.alias} · Titular: ${bank.account_holder}`);
+  const reviewOrderModeLabel = business.order_mode === 'advance'
+    ? `Por encargo (${business.min_advance_days || 1}-${business.max_advance_days || 30} días)`
+    : 'Inmediato';
+  lines.push(`📅 Pedidos: ${reviewOrderModeLabel}`);
 
   if (products.length > 0) {
     lines.push(`\n📦 **Menú (${products.length} productos):**`);
@@ -791,6 +797,24 @@ async function executeIntent(pc, phone, intent, args, business, businessId) {
       return sendMessage(pc, phone, await buildViewMenu(businessId));
     case 'view_business':
       return sendMessage(pc, phone, await buildViewBusiness(businessId));
+
+    case 'order_mode': {
+      const modeConfig = await db.getBusinessOrderMode(businessId);
+      const modeLabel = modeConfig.order_mode === 'advance'
+        ? `Por encargo (${modeConfig.min_advance_days}-${modeConfig.max_advance_days} días)`
+        : 'Inmediato';
+      await db.updateUserStep(phone, STEPS.EDIT_ORDER_MODE);
+      return sendButtons(pc, phone,
+        `📅 *Modo de pedidos actual: ${modeLabel}*\n\n` +
+        '¿Cómo querés recibir pedidos?\n' +
+        '• *Inmediato*: Los clientes piden y esperan delivery/retiro enseguida.\n' +
+        '• *Por encargo*: Los clientes eligen una fecha futura de entrega.',
+        [
+          { id: '1', title: 'Inmediato' },
+          { id: '2', title: 'Por encargo' },
+        ]
+      );
+    }
 
     // ── Order management commands ──
     case 'view_orders':
@@ -1446,6 +1470,79 @@ async function sendCatalogLinkList(pc, phone, businessId) {
   }
 
   return sendMessage(pc, phone, lines.join('\n'));
+}
+
+// In-memory store for multi-step order mode config (phone → { step, order_mode })
+const orderModeConfig = new Map();
+
+async function handleEditOrderMode(pc, phone, text, businessId) {
+  const normalized = text.trim().toUpperCase();
+  const pending = orderModeConfig.get(phone);
+
+  if (normalized === 'CANCELAR') {
+    orderModeConfig.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone, '❌ Configuración cancelada.');
+  }
+
+  // Step 1: Choose mode
+  if (!pending) {
+    if (normalized === '1' || normalized === 'INMEDIATO') {
+      await db.updateBusinessOrderMode(businessId, { order_mode: 'instant' });
+      await db.updateUserStep(phone, STEPS.COMPLETED);
+      return sendMessage(pc, phone, '✅ Modo de pedidos: *Inmediato*\n\nLos clientes piden y reciben lo antes posible.');
+    }
+    if (normalized === '2' || normalized === 'POR ENCARGO') {
+      orderModeConfig.set(phone, { step: 'days' });
+      return sendMessage(pc, phone,
+        '📅 *Configurar pedidos por encargo*\n\n' +
+        'Escribí el rango de días permitidos en formato: *mínimo-máximo*\n' +
+        'Ej: *1-30* (desde mañana hasta 30 días)\n' +
+        'Ej: *3-14* (desde 3 días hasta 2 semanas)\n\n' +
+        'Escribí *CANCELAR* para salir.'
+      );
+    }
+    // Invalid — re-show options
+    return sendButtons(pc, phone,
+      '⚠️ Elegí una opción:',
+      [
+        { id: '1', title: 'Inmediato' },
+        { id: '2', title: 'Por encargo' },
+      ]
+    );
+  }
+
+  // Step 2: Configure days range
+  if (pending.step === 'days') {
+    const rangeMatch = text.trim().match(/^(\d+)\s*[-–]\s*(\d+)$/);
+    if (!rangeMatch) {
+      return sendMessage(pc, phone, '⚠️ Formato incorrecto. Escribí: *mínimo-máximo*\nEj: *1-30*\n\nEscribí *CANCELAR* para salir.');
+    }
+
+    const minDays = parseInt(rangeMatch[1], 10);
+    const maxDays = parseInt(rangeMatch[2], 10);
+
+    if (minDays < 1 || maxDays < minDays || maxDays > 90) {
+      return sendMessage(pc, phone, '⚠️ El mínimo debe ser al menos 1, el máximo no puede superar 90 y debe ser mayor al mínimo.\n\nEj: *1-30*');
+    }
+
+    await db.updateBusinessOrderMode(businessId, {
+      order_mode: 'advance',
+      min_advance_days: minDays,
+      max_advance_days: maxDays,
+    });
+    orderModeConfig.delete(phone);
+    await db.updateUserStep(phone, STEPS.COMPLETED);
+    return sendMessage(pc, phone,
+      `✅ Modo de pedidos: *Por encargo*\n\n` +
+      `📅 Los clientes pueden elegir fecha de entrega entre ${minDays} y ${maxDays} días.\n\n` +
+      'Para cambiar, escribí *PEDIDOS*.'
+    );
+  }
+
+  orderModeConfig.delete(phone);
+  await db.updateUserStep(phone, STEPS.COMPLETED);
+  return sendMessage(pc, phone, '⚠️ Estado desconocido. Escribí *PEDIDOS* para configurar.');
 }
 
 async function handleLinkCatalog(pc, phone, text, businessId) {
@@ -2201,7 +2298,8 @@ function helpText(hasAI = true) {
     '• *PAUSAR PRODUCTO* — Activar/desactivar un producto\n' +
     '• *SINCRONIZAR* — Actualizar del catálogo\n\n' +
     '⚙️ *Configuración:*\n' +
-    '• *VER NEGOCIO* — Ver tu configuración\n\n' +
+    '• *VER NEGOCIO* — Ver tu configuración\n' +
+    '• *PEDIDOS* — Configurar modo de pedidos (inmediato/por encargo)\n\n' +
     '💼 *Suscripción:*\n' +
     '• *PLAN* — Ver tu plan actual y uso\n' +
     '• *PLANES* — Comparar planes disponibles\n' +
@@ -2259,6 +2357,10 @@ async function buildViewBusiness(businessId) {
   }
   lines.push(`💳 Pagos: ${getPaymentLabel(business)}`);
   if (bank) lines.push(`🏦 Alias: ${bank.alias} · Titular: ${bank.account_holder}`);
+  const bizOrderModeLabel = business.order_mode === 'advance'
+    ? `Por encargo (${business.min_advance_days || 1}-${business.max_advance_days || 30} días)`
+    : 'Inmediato';
+  lines.push(`📅 Pedidos: ${bizOrderModeLabel}`);
   lines.push(`📦 Menú: ${active} activos, ${paused} pausado${paused !== 1 ? 's' : ''}`);
   lines.push(`✅ Estado: ${business.is_active ? 'Activo' : 'Inactivo'}`);
 

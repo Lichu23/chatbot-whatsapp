@@ -108,6 +108,8 @@ async function handleCustomerStep(pc, phone, text, state, business, profileName,
       return handleCustomerDeliveryZone(pc, phone, text, state, business);
     case CUSTOMER_STEPS.DELIVERY_ADDRESS:
       return handleCustomerDeliveryAddress(pc, phone, text, state, business);
+    case CUSTOMER_STEPS.DELIVERY_DATE:
+      return handleCustomerDeliveryDate(pc, phone, text, state, business);
     case CUSTOMER_STEPS.PAYMENT_METHOD:
       return handleCustomerPaymentMethod(pc, phone, text, state, business);
     case CUSTOMER_STEPS.AWAITING_TRANSFER:
@@ -503,7 +505,16 @@ async function advanceToDelivery(pc, phone, state, business) {
     return showDeliveryZones(pc, phone, business.id);
   }
 
-  // Pickup only → skip to payment
+  // Pickup only → check for advance order mode
+  if (business.order_mode === 'advance') {
+    await db.upsertCustomerState(phone, {
+      ...stateFields(state),
+      delivery_method: 'pickup',
+      current_step: CUSTOMER_STEPS.DELIVERY_DATE,
+    });
+    return showDeliveryDateSelection(pc, phone, business);
+  }
+
   await db.upsertCustomerState(phone, {
     ...stateFields(state),
     delivery_method: 'pickup',
@@ -536,6 +547,14 @@ async function handleCustomerDeliveryMethod(pc, phone, text, state, business) {
   }
 
   if (isPickup) {
+    if (business.order_mode === 'advance') {
+      await db.upsertCustomerState(phone, {
+        ...stateFields(state),
+        delivery_method: 'pickup',
+        current_step: CUSTOMER_STEPS.DELIVERY_DATE,
+      });
+      return showDeliveryDateSelection(pc, phone, business);
+    }
     await db.upsertCustomerState(phone, {
       ...stateFields(state),
       delivery_method: 'pickup',
@@ -621,10 +640,123 @@ async function handleCustomerDeliveryAddress(pc, phone, text, state, business) {
 
   const address = text.trim();
 
+  if (business.order_mode === 'advance') {
+    // Store address in state and go to date selection
+    const updatedCart = [...(state.cart || [])];
+    // Store address temporarily in state metadata
+    const contextIdx = updatedCart.findIndex((item) => item._order_context);
+    if (contextIdx >= 0) {
+      updatedCart[contextIdx] = { ...updatedCart[contextIdx], address };
+    } else {
+      updatedCart.push({ _pending_address: true, address });
+    }
+    await db.upsertCustomerState(phone, {
+      ...stateFields(state),
+      cart: updatedCart,
+      current_step: CUSTOMER_STEPS.DELIVERY_DATE,
+    });
+    return showDeliveryDateSelection(pc, phone, business);
+  }
+
   await db.updateCustomerStep(phone, CUSTOMER_STEPS.PAYMENT_METHOD, business.id);
 
   const updatedState = await db.getCustomerState(phone, business.id);
   return showOrderSummaryAndPayment(pc, phone, updatedState, business, 'delivery', address);
+}
+
+// ══════════════════════════════════════
+// STEP 5b: DELIVERY DATE (advance orders)
+// ══════════════════════════════════════
+
+function generateAvailableDates(minDays, maxDays) {
+  const dates = [];
+  const dayNames = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  const now = new Date();
+
+  for (let i = minDays; i <= maxDays && dates.length < 10; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + i);
+    const dayName = dayNames[d.getDay()];
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const yyyy = d.getFullYear();
+    dates.push({
+      label: `${dayName} ${dd}/${mm}`,
+      value: `${yyyy}-${mm}-${dd}`,
+      displayFull: `${dayName} ${dd}/${mm}/${yyyy}`,
+    });
+  }
+  return dates;
+}
+
+async function showDeliveryDateSelection(pc, phone, business) {
+  const minDays = business.min_advance_days || 1;
+  const maxDays = business.max_advance_days || 30;
+  const dates = generateAvailableDates(minDays, maxDays);
+
+  if (dates.length === 0) {
+    return sendMessage(pc, phone, '⚠️ No hay fechas disponibles. Contactá al local.');
+  }
+
+  return sendList(pc, phone,
+    '📅 *¿Para qué fecha querés tu pedido?*\n\nElegí una fecha de entrega.\nEscribí *CANCELAR* para cancelar el pedido.',
+    'Ver fechas',
+    [
+      {
+        title: 'Fechas disponibles',
+        rows: dates.map((d, i) => ({
+          id: String(i + 1),
+          title: d.label,
+          description: d.value,
+        })),
+      },
+    ]
+  );
+}
+
+async function handleCustomerDeliveryDate(pc, phone, text, state, business) {
+  if (text.trim().toUpperCase() === 'CANCELAR') {
+    await db.deleteCustomerState(phone, business.id);
+    return sendMessage(pc, phone, '❌ Pedido cancelado.');
+  }
+
+  const minDays = business.min_advance_days || 1;
+  const maxDays = business.max_advance_days || 30;
+  const dates = generateAvailableDates(minDays, maxDays);
+  const num = parseInt(text.trim(), 10);
+
+  if (isNaN(num) || num < 1 || num > dates.length) {
+    return showDeliveryDateSelection(pc, phone, business);
+  }
+
+  const selectedDate = dates[num - 1];
+
+  // Retrieve address from pending cart metadata if delivery
+  const cart = state.cart || [];
+  let address = null;
+  const pendingIdx = cart.findIndex((item) => item._pending_address);
+  if (pendingIdx >= 0) {
+    address = cart[pendingIdx].address;
+    cart.splice(pendingIdx, 1);
+  }
+
+  // Store delivery_date in a cart context item
+  const contextIdx = cart.findIndex((item) => item._order_context);
+  if (contextIdx >= 0) {
+    cart[contextIdx] = { ...cart[contextIdx], delivery_date: selectedDate.value, delivery_date_label: selectedDate.displayFull };
+  } else {
+    cart.push({ _delivery_date_pending: true, delivery_date: selectedDate.value, delivery_date_label: selectedDate.displayFull });
+  }
+
+  await db.upsertCustomerState(phone, {
+    ...stateFields(state),
+    cart,
+    current_step: CUSTOMER_STEPS.PAYMENT_METHOD,
+  });
+
+  const updatedState = await db.getCustomerState(phone, business.id);
+  const method = updatedState.delivery_method || 'pickup';
+  return showOrderSummaryAndPayment(pc, phone, updatedState, business, method, address);
 }
 
 // ══════════════════════════════════════
@@ -633,6 +765,17 @@ async function handleCustomerDeliveryAddress(pc, phone, text, state, business) {
 
 async function showOrderSummaryAndPayment(pc, phone, state, business, method, address) {
   const cart = state.cart || [];
+
+  // Extract delivery date info from pending cart metadata
+  let deliveryDate = null;
+  let deliveryDateLabel = null;
+  const datePendingIdx = cart.findIndex((item) => item._delivery_date_pending);
+  if (datePendingIdx >= 0) {
+    deliveryDate = cart[datePendingIdx].delivery_date;
+    deliveryDateLabel = cart[datePendingIdx].delivery_date_label;
+    cart.splice(datePendingIdx, 1);
+  }
+
   const subtotal = cart.reduce((sum, item) => sum + item.price * item.qty, 0);
 
   let deliveryPrice = 0;
@@ -675,6 +818,10 @@ async function showOrderSummaryAndPayment(pc, phone, state, business, method, ad
     }
   }
 
+  if (deliveryDateLabel) {
+    lines.push(`📅 Fecha de entrega: ${deliveryDateLabel}`);
+  }
+
   if (loyaltyDiscount > 0) {
     lines.push(`🏆 Recompensa fidelidad: -$${formatPrice(loyaltyDiscount)}`);
   }
@@ -712,6 +859,8 @@ async function showOrderSummaryAndPayment(pc, phone, state, business, method, ad
     delivery_method: method,
     payment_options: paymentOptions,
     loyalty_discount: loyaltyDiscount || 0,
+    delivery_date: deliveryDate || null,
+    delivery_date_label: deliveryDateLabel || null,
   };
 
   // Store context in cart (append as last item with special flag)
@@ -947,6 +1096,7 @@ async function confirmAndSaveOrder(pc, phone, state, business) {
     grand_total: grandTotal,
     payment_method: paymentMethod,
     deposit_amount: depositAmount,
+    delivery_date: contextItem.delivery_date || null,
   });
 
   // Increment monthly order count
@@ -978,6 +1128,10 @@ async function confirmAndSaveOrder(pc, phone, state, business) {
     lines.push(`🚚 Delivery a: ${contextItem.address}${contextItem.zone_name ? `, ${contextItem.zone_name}` : ''}`);
   } else if (contextItem.delivery_method === 'pickup' && business.business_address) {
     lines.push(`🏪 Retiro en: ${business.business_address}`);
+  }
+
+  if (contextItem.delivery_date_label) {
+    lines.push(`📅 Fecha de entrega: ${contextItem.delivery_date_label}`);
   }
 
   if (contextItem.loyalty_discount > 0) {
@@ -1028,6 +1182,10 @@ async function notifyAdminNewOrder(pc, order, items, context, business, clientPh
     if (context.address) lines.push(`📍 ${context.address}`);
   } else {
     lines.push('🏪 Retiro en local');
+  }
+
+  if (context.delivery_date_label) {
+    lines.push(`📅 Fecha de entrega: ${context.delivery_date_label}`);
   }
 
   if (context.promo_code) {
